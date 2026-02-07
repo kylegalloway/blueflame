@@ -3,6 +3,8 @@ package ui
 import (
 	"os"
 	"testing"
+
+	"github.com/kylegalloway/blueflame/internal/state"
 )
 
 func TestScriptedPrompterPlan(t *testing.T) {
@@ -10,17 +12,17 @@ func TestScriptedPrompterPlan(t *testing.T) {
 		PlanDecisions: []PlanDecision{PlanApprove, PlanReplan, PlanAbort},
 	}
 
-	if d := p.PlanApproval(3, "$1.50"); d != PlanApprove {
+	if d, _ := p.PlanApproval(3, "$1.50"); d != PlanApprove {
 		t.Errorf("first = %d, want PlanApprove", d)
 	}
-	if d := p.PlanApproval(3, "$1.50"); d != PlanReplan {
+	if d, _ := p.PlanApproval(3, "$1.50"); d != PlanReplan {
 		t.Errorf("second = %d, want PlanReplan", d)
 	}
-	if d := p.PlanApproval(3, "$1.50"); d != PlanAbort {
+	if d, _ := p.PlanApproval(3, "$1.50"); d != PlanAbort {
 		t.Errorf("third = %d, want PlanAbort", d)
 	}
 	// Exhausted -> default to abort
-	if d := p.PlanApproval(3, "$1.50"); d != PlanAbort {
+	if d, _ := p.PlanApproval(3, "$1.50"); d != PlanAbort {
 		t.Errorf("exhausted = %d, want PlanAbort", d)
 	}
 }
@@ -125,5 +127,51 @@ func TestScriptedPrompterFromFileMissing(t *testing.T) {
 	p := NewScriptedPrompterFromFile("/nonexistent/path")
 	if len(p.PlanDecisions) != 0 {
 		t.Errorf("expected empty decisions for missing file")
+	}
+}
+
+func TestScriptedPrompterCrashRecovery(t *testing.T) {
+	p := &ScriptedPrompter{
+		RecoveryDecisions: []CrashRecoveryDecision{RecoveryResume, RecoveryFresh},
+	}
+
+	rs := &state.OrchestratorState{SessionID: "ses-test", WaveCycle: 2}
+
+	if d := p.CrashRecoveryPrompt(rs); d != RecoveryResume {
+		t.Errorf("first = %d, want RecoveryResume", d)
+	}
+	if d := p.CrashRecoveryPrompt(rs); d != RecoveryFresh {
+		t.Errorf("second = %d, want RecoveryFresh", d)
+	}
+	// Exhausted -> default to RecoveryFresh
+	if d := p.CrashRecoveryPrompt(rs); d != RecoveryFresh {
+		t.Errorf("exhausted = %d, want RecoveryFresh", d)
+	}
+}
+
+func TestScriptedPrompterFromFileRecovery(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/decisions.txt"
+	content := `recovery-resume
+recovery-fresh
+approve
+`
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	p := NewScriptedPrompterFromFile(path)
+
+	if len(p.RecoveryDecisions) != 2 {
+		t.Fatalf("RecoveryDecisions len = %d, want 2", len(p.RecoveryDecisions))
+	}
+	if p.RecoveryDecisions[0] != RecoveryResume {
+		t.Errorf("first recovery = %d, want RecoveryResume", p.RecoveryDecisions[0])
+	}
+	if p.RecoveryDecisions[1] != RecoveryFresh {
+		t.Errorf("second recovery = %d, want RecoveryFresh", p.RecoveryDecisions[1])
+	}
+	if len(p.PlanDecisions) != 1 {
+		t.Errorf("PlanDecisions len = %d, want 1", len(p.PlanDecisions))
 	}
 }

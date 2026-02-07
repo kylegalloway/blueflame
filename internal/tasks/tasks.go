@@ -132,6 +132,19 @@ func (t *Task) SetValidationResult(status string, notes string) error {
 	return nil
 }
 
+// ResetClaimed transitions a task from claimed back to pending,
+// clearing agent assignment fields. Used during crash recovery
+// since the agents that claimed these tasks are dead.
+func (t *Task) ResetClaimed() {
+	if t.Status != StatusClaimed {
+		return
+	}
+	t.Status = StatusPending
+	t.AgentID = ""
+	t.Worktree = ""
+	t.Branch = ""
+}
+
 // DependsOn returns true if this task depends on the given task ID.
 func (t *Task) DependsOn(taskID string) bool {
 	for _, dep := range t.Dependencies {
@@ -221,6 +234,17 @@ func (s *TaskStore) Tasks() []Task {
 		return nil
 	}
 	return s.file.Tasks
+}
+
+// ResetClaimedTasks resets all claimed tasks back to pending.
+// Used during crash recovery since claimed tasks had agents that are now dead.
+func (s *TaskStore) ResetClaimedTasks() {
+	if s.file == nil {
+		return
+	}
+	for i := range s.file.Tasks {
+		s.file.Tasks[i].ResetClaimed()
+	}
 }
 
 // FindTask returns a pointer to the task with the given ID.

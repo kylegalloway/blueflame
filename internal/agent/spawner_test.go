@@ -40,7 +40,7 @@ func testConfig() *config.Config {
 func TestMockSpawnerWorker(t *testing.T) {
 	spawner := &MockSpawner{
 		WorkerResults: map[string]MockResult{
-			"task-001": {Output: `{"result":"done","cost_usd":0.50,"input_tokens":1000,"output_tokens":500}`},
+			"task-001": {Output: `{"type":"result","result":"done","total_cost_usd":0.50,"usage":{"input_tokens":1000,"output_tokens":500}}`},
 		},
 	}
 
@@ -66,8 +66,8 @@ func TestMockSpawnerWorker(t *testing.T) {
 	if result.ExitCode != 0 {
 		t.Errorf("ExitCode = %d, want 0", result.ExitCode)
 	}
-	if result.Output.CostUSD != 0.50 {
-		t.Errorf("CostUSD = %f, want 0.50", result.Output.CostUSD)
+	if result.Output.TotalCostUSD != 0.50 {
+		t.Errorf("TotalCostUSD = %f, want 0.50", result.Output.TotalCostUSD)
 	}
 	if result.TokensUsed != 1500 {
 		t.Errorf("TokensUsed = %d, want 1500", result.TokensUsed)

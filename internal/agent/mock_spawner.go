@@ -165,8 +165,8 @@ func MockCollectResult(agent *Agent) AgentResult {
 		Output:     output,
 		RawStdout:  agent.Stdout.Bytes(),
 		RawStderr:  agent.Stderr.Bytes(),
-		CostUSD:    output.CostUSD,
-		TokensUsed: output.InputTokens + output.OutputTokens,
+		CostUSD:    output.TotalCostUSD,
+		TokensUsed: output.Usage.InputTokens + output.Usage.OutputTokens,
 		Duration:   time.Since(agent.Started),
 		Err:        err,
 	}

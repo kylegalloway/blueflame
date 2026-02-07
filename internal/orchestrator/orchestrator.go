@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
+	"text/template"
 	"time"
 
 	"github.com/kylegalloway/blueflame/internal/agent"
@@ -34,14 +36,18 @@ type Orchestrator struct {
 	lifecycle *agent.LifecycleManager
 	worktrees *worktree.Manager
 	locks     *locks.Manager
-	memory    memory.Provider
-	hooksDir  string
+	memory      memory.Provider
+	hooksDir    string
+	watcherTmpl *template.Template
 
 	sessionCost   float64
 	sessionTokens int
 
 	// agentLocks tracks which lock paths each agent holds, for per-agent release.
 	agentLocks map[string][]string
+
+	// recoveryState holds crash recovery state when resuming a previous session.
+	recoveryState *state.OrchestratorState
 }
 
 // New creates a new Orchestrator.
@@ -72,9 +78,10 @@ func (o *Orchestrator) SetLockManager(lm *locks.Manager) {
 	o.locks = lm
 }
 
-// SetHooksDir sets the base directory for generated hook scripts.
-func (o *Orchestrator) SetHooksDir(dir string) {
+// SetHooksDir sets the base directory for generated hook scripts and the watcher template.
+func (o *Orchestrator) SetHooksDir(dir string, tmpl *template.Template) {
 	o.hooksDir = dir
+	o.watcherTmpl = tmpl
 }
 
 // SetMemoryProvider sets the memory provider for cross-session context.
@@ -87,6 +94,12 @@ func (o *Orchestrator) SetLifecycleManager(lm *agent.LifecycleManager) {
 	o.lifecycle = lm
 }
 
+// SetRecoveryState sets crash recovery state. When set, Run() will skip
+// planning and resume at the recovered wave cycle.
+func (o *Orchestrator) SetRecoveryState(rs *state.OrchestratorState) {
+	o.recoveryState = rs
+}
+
 // Run executes the full wave orchestration loop.
 func (o *Orchestrator) Run(ctx context.Context, taskDescription string) error {
 	// Start lifecycle monitor if configured
@@ -96,57 +109,123 @@ func (o *Orchestrator) Run(ctx context.Context, taskDescription string) error {
 		go o.lifecycle.MonitorLoop(monitorCtx)
 	}
 
-	// Wave 1: Planning
-	o.state.Phase = "planning"
-	o.persistState()
+	startCycle := 1
 
-	// Load prior session context for planner
-	var priorContext string
-	if o.memory != nil {
-		if memCtx, loadErr := o.memory.Load(); loadErr == nil && memCtx.SessionCount > 0 {
-			priorContext = fmt.Sprintf("Prior sessions: %d. Prior failures: %d.",
-				memCtx.SessionCount, len(memCtx.PriorFailures))
-			for _, f := range memCtx.PriorFailures {
-				priorContext += fmt.Sprintf("\n- Task %s (%s): %s", f.ID, f.Title, f.FailureReason)
+	if o.recoveryState != nil {
+		// Crash recovery: skip planning, restore state, reset claimed tasks
+		o.state.SessionID = o.recoveryState.SessionID
+		o.state.StartTime = o.recoveryState.StartTime
+		o.sessionCost = o.recoveryState.SessionCost
+		o.sessionTokens = o.recoveryState.SessionTokens
+		o.state.SessionCost = o.recoveryState.SessionCost
+		o.state.SessionTokens = o.recoveryState.SessionTokens
+		startCycle = o.recoveryState.WaveCycle
+
+		// Load tasks from disk (already persisted from previous session)
+		if err := o.taskStore.Load(); err != nil {
+			return fmt.Errorf("load tasks for recovery: %w", err)
+		}
+
+		// Reset any claimed tasks back to pending (their agents are dead)
+		o.taskStore.ResetClaimedTasks()
+		if err := o.taskStore.Save(); err != nil {
+			return fmt.Errorf("save tasks after reset: %w", err)
+		}
+
+		o.ui.Info(fmt.Sprintf("Resuming session %s from wave cycle %d", o.state.SessionID, startCycle))
+		o.ui.Info(fmt.Sprintf("  Accumulated cost: $%.2f (%d tokens)", o.sessionCost, o.sessionTokens))
+
+		taskSummary := o.taskStore.Tasks()
+		var pending, done, failed, merged int
+		for _, t := range taskSummary {
+			switch t.Status {
+			case tasks.StatusPending:
+				pending++
+			case tasks.StatusDone:
+				done++
+			case tasks.StatusFailed:
+				failed++
+			case tasks.StatusMerged:
+				merged++
 			}
 		}
-	}
+		o.ui.Info(fmt.Sprintf("  Tasks: %d pending, %d done, %d failed, %d merged",
+			pending, done, failed, merged))
+	} else {
+		// Normal path: run planning
+		o.state.Phase = "planning"
+		o.persistState()
 
-	plan, err := o.runPlanning(ctx, taskDescription, priorContext)
-	if err != nil {
-		return fmt.Errorf("planning: %w", err)
-	}
+		// Load prior session context for planner
+		var priorContext string
+		if o.memory != nil {
+			if memCtx, loadErr := o.memory.Load(); loadErr == nil && memCtx.SessionCount > 0 {
+				priorContext = fmt.Sprintf("Prior sessions: %d. Prior failures: %d.",
+					memCtx.SessionCount, len(memCtx.PriorFailures))
+				for _, f := range memCtx.PriorFailures {
+					priorContext += fmt.Sprintf("\n- Task %s (%s): %s", f.ID, f.Title, f.FailureReason)
+				}
+			}
+		}
 
-	// Store planned tasks
-	o.taskStore.SetFile(&tasks.TaskFile{
-		SchemaVersion: 1,
-		SessionID:     o.state.SessionID,
-		WaveCycle:     1,
-		Tasks:         plan,
-	})
-	if err := o.taskStore.Save(); err != nil {
-		return fmt.Errorf("save tasks: %w", err)
-	}
+		for {
+			plan, err := o.runPlanning(ctx, taskDescription, priorContext)
+			if err != nil {
+				return fmt.Errorf("planning: %w", err)
+			}
 
-	// Present plan for approval
-	decision := o.ui.PlanApproval(len(plan), o.estimateCost(len(plan)))
-	switch decision {
-	case ui.PlanApprove:
-		// Continue
-	case ui.PlanAbort:
-		return ErrPlanRejected
-	case ui.PlanReplan:
-		// Re-plan (simplified: just fail for now, full re-plan in production)
-		return ErrPlanRejected
-	case ui.PlanEdit:
-		// Human edits tasks.yaml, then reload
-		if err := o.taskStore.Load(); err != nil {
-			return fmt.Errorf("reload tasks after edit: %w", err)
+			// Store planned tasks
+			o.taskStore.SetFile(&tasks.TaskFile{
+				SchemaVersion: 1,
+				SessionID:     o.state.SessionID,
+				WaveCycle:     1,
+				Tasks:         plan,
+			})
+			if err := o.taskStore.Save(); err != nil {
+				return fmt.Errorf("save tasks: %w", err)
+			}
+
+			// Display the plan
+			o.ui.Info(fmt.Sprintf("\nPlanned %d task(s), estimated cost: %s\n", len(plan), o.estimateCost(len(plan))))
+			for i, t := range plan {
+				deps := "none"
+				if len(t.Dependencies) > 0 {
+					deps = strings.Join(t.Dependencies, ", ")
+				}
+				locks := "none"
+				if len(t.FileLocks) > 0 {
+					locks = strings.Join(t.FileLocks, ", ")
+				}
+				o.ui.Info(fmt.Sprintf("  %d. [%s] %s (priority %d)", i+1, t.ID, t.Title, t.Priority))
+				o.ui.Info(fmt.Sprintf("     %s", t.Description))
+				o.ui.Info(fmt.Sprintf("     deps: %s | locks: %s", deps, locks))
+			}
+
+			// Present plan for approval
+			decision, feedback := o.ui.PlanApproval(len(plan), o.estimateCost(len(plan)))
+			switch decision {
+			case ui.PlanApprove:
+				// Continue to development
+			case ui.PlanAbort:
+				return ErrPlanRejected
+			case ui.PlanReplan:
+				o.ui.Info("Re-planning...")
+				if feedback != "" {
+					priorContext += fmt.Sprintf("\n\nUser feedback on previous plan: %s", feedback)
+				}
+				continue
+			case ui.PlanEdit:
+				// Human edits tasks.yaml, then reload
+				if err := o.taskStore.Load(); err != nil {
+					return fmt.Errorf("reload tasks after edit: %w", err)
+				}
+			}
+			break
 		}
 	}
 
 	// Wave cycles (development -> validation -> merge -> repeat)
-	for cycle := 1; cycle <= o.config.Limits.MaxWaveCycles; cycle++ {
+	for cycle := startCycle; cycle <= o.config.Limits.MaxWaveCycles; cycle++ {
 		o.state.WaveCycle = cycle
 		o.taskStore.File().WaveCycle = cycle
 
@@ -330,7 +409,7 @@ func (o *Orchestrator) runDevelopment(ctx context.Context) []agent.AgentResult {
 		if o.hooksDir != "" {
 			hookData := agent.BuildWatcherData(agentID, agent.RoleWorker, task, o.config, o.hooksDir)
 			hookPath := fmt.Sprintf("%s/%s-watcher.sh", o.hooksDir, agentID)
-			if err := agent.GenerateWatcherHookFromTemplate(nil, hookData, hookPath); err != nil {
+			if err := agent.GenerateWatcherHookFromTemplate(o.watcherTmpl, hookData, hookPath); err != nil {
 				// Non-fatal: log and continue without hooks
 				o.ui.Warn(fmt.Sprintf("generate hooks for %s: %v", task.ID, err))
 			} else {

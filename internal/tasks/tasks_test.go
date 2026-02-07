@@ -302,3 +302,92 @@ func TestTaskStoreLoadMissing(t *testing.T) {
 		t.Error("expected error for missing file")
 	}
 }
+
+func TestResetClaimed(t *testing.T) {
+	task := &Task{
+		ID:       "task-001",
+		Status:   StatusClaimed,
+		AgentID:  "worker-1",
+		Worktree: "/tmp/wt",
+		Branch:   "blueflame/task-001",
+	}
+	task.ResetClaimed()
+
+	if task.Status != StatusPending {
+		t.Errorf("Status = %q, want %q", task.Status, StatusPending)
+	}
+	if task.AgentID != "" {
+		t.Errorf("AgentID = %q, want empty", task.AgentID)
+	}
+	if task.Worktree != "" {
+		t.Errorf("Worktree = %q, want empty", task.Worktree)
+	}
+	if task.Branch != "" {
+		t.Errorf("Branch = %q, want empty", task.Branch)
+	}
+}
+
+func TestResetClaimedSkipsOtherStatuses(t *testing.T) {
+	statuses := []string{StatusPending, StatusDone, StatusFailed, StatusBlocked, StatusMerged}
+	for _, s := range statuses {
+		task := &Task{
+			ID:       "task-001",
+			Status:   s,
+			AgentID:  "worker-1",
+			Worktree: "/tmp/wt",
+			Branch:   "blueflame/task-001",
+		}
+		task.ResetClaimed()
+
+		if task.Status != s {
+			t.Errorf("status %q was changed to %q, should be unchanged", s, task.Status)
+		}
+		if task.AgentID != "worker-1" {
+			t.Errorf("AgentID was cleared for status %q, should be unchanged", s)
+		}
+	}
+}
+
+func TestResetClaimedTasks(t *testing.T) {
+	store := NewTaskStore("")
+	store.SetFile(&TaskFile{
+		Tasks: []Task{
+			{ID: "task-001", Status: StatusClaimed, AgentID: "w1", Worktree: "/wt1", Branch: "b1"},
+			{ID: "task-002", Status: StatusPending, AgentID: "", Worktree: "", Branch: ""},
+			{ID: "task-003", Status: StatusDone, AgentID: "w2", Worktree: "/wt2", Branch: "b2"},
+			{ID: "task-004", Status: StatusClaimed, AgentID: "w3", Worktree: "/wt3", Branch: "b3"},
+		},
+	})
+
+	store.ResetClaimedTasks()
+
+	tasks := store.Tasks()
+	// task-001: claimed -> pending
+	if tasks[0].Status != StatusPending {
+		t.Errorf("task-001 status = %q, want pending", tasks[0].Status)
+	}
+	if tasks[0].AgentID != "" {
+		t.Errorf("task-001 AgentID = %q, want empty", tasks[0].AgentID)
+	}
+
+	// task-002: pending -> unchanged
+	if tasks[1].Status != StatusPending {
+		t.Errorf("task-002 status = %q, want pending", tasks[1].Status)
+	}
+
+	// task-003: done -> unchanged
+	if tasks[2].Status != StatusDone {
+		t.Errorf("task-003 status = %q, want done", tasks[2].Status)
+	}
+	if tasks[2].AgentID != "w2" {
+		t.Errorf("task-003 AgentID = %q, want w2", tasks[2].AgentID)
+	}
+
+	// task-004: claimed -> pending
+	if tasks[3].Status != StatusPending {
+		t.Errorf("task-004 status = %q, want pending", tasks[3].Status)
+	}
+	if tasks[3].Worktree != "" {
+		t.Errorf("task-004 Worktree = %q, want empty", tasks[3].Worktree)
+	}
+}

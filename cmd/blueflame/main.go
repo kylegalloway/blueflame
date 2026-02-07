@@ -94,7 +94,7 @@ func main() {
 
 	// Initialize managers
 	lockMgr := locks.NewManager(filepath.Join(stateDir, "locks"))
-	stateMgr := state.NewManager(filepath.Join(stateDir, "state.json"))
+	stateMgr := state.NewManager(stateDir)
 	taskStore := tasks.NewTaskStore(filepath.Join(cfg.Project.Repo, cfg.Project.TasksFile))
 
 	lifecycleMgr := agent.NewLifecycleManager(agent.LifecycleConfig{
@@ -119,20 +119,24 @@ func main() {
 		}
 	}
 
-	// Handle crash recovery prompt
-	if cleanupResult != nil && cleanupResult.RecoveryState != nil {
-		fmt.Printf("Previous session found at wave %d, phase %q.\n",
-			cleanupResult.RecoveryState.WaveCycle, cleanupResult.RecoveryState.Phase)
-		fmt.Println("Starting fresh session (crash recovery resume not yet implemented).")
-		stateMgr.Remove()
-	}
-
-	// Choose prompter
+	// Choose prompter (before recovery check so it can prompt the user)
 	var prompter ui.Prompter
 	if *decisionsFile != "" {
 		prompter = ui.NewScriptedPrompterFromFile(*decisionsFile)
 	} else {
 		prompter = ui.NewTerminalPrompter()
+	}
+
+	// Handle crash recovery prompt
+	var recoveryState *state.OrchestratorState
+	if cleanupResult != nil && cleanupResult.RecoveryState != nil {
+		decision := prompter.CrashRecoveryPrompt(cleanupResult.RecoveryState)
+		switch decision {
+		case ui.RecoveryResume:
+			recoveryState = cleanupResult.RecoveryState
+		case ui.RecoveryFresh:
+			stateMgr.Remove()
+		}
 	}
 
 	// Create spawner and orchestrator
@@ -145,7 +149,10 @@ func main() {
 	orch.SetLifecycleManager(lifecycleMgr)
 	orch.SetWorktreeManager(wtMgr)
 	orch.SetLockManager(lockMgr)
-	orch.SetHooksDir(filepath.Join(stateDir, "hooks"))
+	orch.SetHooksDir(filepath.Join(stateDir, "hooks"), agent.DefaultWatcherTemplate())
+	if recoveryState != nil {
+		orch.SetRecoveryState(recoveryState)
+	}
 
 	// Wire memory provider
 	var memProvider memory.Provider
@@ -213,7 +220,7 @@ func runCleanup() {
 	stateDir := filepath.Join(cfg.Project.Repo, ".blueflame")
 
 	lockMgr := locks.NewManager(filepath.Join(stateDir, "locks"))
-	stateMgr := state.NewManager(filepath.Join(stateDir, "state.json"))
+	stateMgr := state.NewManager(stateDir)
 	wtMgr := worktree.NewManager(cfg.Project.Repo, cfg.Project.WorktreeDir, cfg.Project.BaseBranch)
 	lifecycleMgr := agent.NewLifecycleManager(agent.LifecycleConfig{
 		PersistPath: filepath.Join(stateDir, "agents.json"),

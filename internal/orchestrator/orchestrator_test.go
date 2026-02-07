@@ -297,6 +297,145 @@ func TestOrchestratorStatePersistence(t *testing.T) {
 	}
 }
 
+func TestCrashRecoveryResume(t *testing.T) {
+	cfg := testOrchestratorConfig(t)
+	cfg.Limits.MaxWaveCycles = 5
+
+	// Pre-create tasks.yaml simulating a crashed session
+	taskStore := tasks.NewTaskStore(cfg.Project.TasksFile)
+	taskStore.SetFile(&tasks.TaskFile{
+		SchemaVersion: 1,
+		SessionID:     "ses-crashed",
+		WaveCycle:     2,
+		Tasks: []tasks.Task{
+			{ID: "task-001", Title: "Done task", Status: tasks.StatusDone, Priority: 1,
+				FileLocks: []string{"a/"}, Result: tasks.TaskResult{Status: "pass"}},
+			{ID: "task-002", Title: "Pending task", Status: tasks.StatusPending, Priority: 2,
+				FileLocks: []string{"b/"}},
+			{ID: "task-003", Title: "Merged task", Status: tasks.StatusMerged, Priority: 3,
+				FileLocks: []string{"c/"}},
+		},
+	})
+	if err := taskStore.Save(); err != nil {
+		t.Fatalf("save pre-existing tasks: %v", err)
+	}
+
+	// Spawner: only task-002 needs development work
+	spawner := &agent.MockSpawner{
+		WorkerResults: map[string]agent.MockResult{
+			"task-002": {Output: `{"result":"done","cost_usd":0.30}`},
+		},
+		ValidatorResults: map[string]agent.MockResult{
+			"task-001": {Output: `{"status":"pass","notes":"already good"}`},
+			"task-002": {Output: `{"status":"pass","notes":"looks good"}`},
+		},
+	}
+
+	prompter := &ui.ScriptedPrompter{
+		// No PlanDecisions needed — planning is skipped
+		ChangesetDecisions: []ui.ChangesetDecision{ui.ChangesetApprove},
+		SessionDecisions:   []ui.SessionDecision{ui.SessionStop},
+	}
+
+	stateMgr := state.NewManager(t.TempDir())
+	orch := New(cfg, spawner, prompter, taskStore, stateMgr)
+
+	// Set recovery state to resume from wave cycle 2
+	orch.SetRecoveryState(&state.OrchestratorState{
+		SessionID:     "ses-crashed",
+		WaveCycle:     2,
+		Phase:         "development",
+		SessionCost:   1.50,
+		SessionTokens: 5000,
+	})
+
+	err := orch.Run(context.Background(), "ignored during recovery")
+	if err != nil {
+		t.Fatalf("Run with recovery: %v", err)
+	}
+
+	// Verify session ID was preserved
+	summary := orch.SessionSummary()
+	if summary.SessionID != "ses-crashed" {
+		t.Errorf("SessionID = %q, want %q", summary.SessionID, "ses-crashed")
+	}
+
+	// Verify accumulated cost includes the recovered cost
+	if summary.TotalCost < 1.50 {
+		t.Errorf("TotalCost = %.2f, want >= 1.50 (recovered cost)", summary.TotalCost)
+	}
+
+	// Verify no planning decisions were consumed
+	// (PlanDecisions is empty, so if planning ran it would abort)
+}
+
+func TestCrashRecoveryResetsClaimed(t *testing.T) {
+	cfg := testOrchestratorConfig(t)
+	cfg.Limits.MaxWaveCycles = 3
+
+	// Pre-create tasks with a claimed task (simulating crash mid-development)
+	taskStore := tasks.NewTaskStore(cfg.Project.TasksFile)
+	taskStore.SetFile(&tasks.TaskFile{
+		SchemaVersion: 1,
+		SessionID:     "ses-crashed2",
+		WaveCycle:     1,
+		Tasks: []tasks.Task{
+			{ID: "task-001", Title: "Claimed task", Status: tasks.StatusClaimed,
+				AgentID: "dead-worker", Worktree: "/tmp/dead-wt", Branch: "dead-branch",
+				Priority: 1, FileLocks: []string{"a/"}},
+			{ID: "task-002", Title: "Pending task", Status: tasks.StatusPending,
+				Priority: 2, FileLocks: []string{"b/"}},
+		},
+	})
+	if err := taskStore.Save(); err != nil {
+		t.Fatalf("save tasks: %v", err)
+	}
+
+	spawner := &agent.MockSpawner{
+		WorkerResults: map[string]agent.MockResult{
+			"task-001": {Output: `{"result":"done"}`},
+			"task-002": {Output: `{"result":"done"}`},
+		},
+		ValidatorResults: map[string]agent.MockResult{
+			"task-001": {Output: `{"status":"pass","notes":"ok"}`},
+			"task-002": {Output: `{"status":"pass","notes":"ok"}`},
+		},
+	}
+
+	prompter := &ui.ScriptedPrompter{
+		ChangesetDecisions: []ui.ChangesetDecision{ui.ChangesetApprove},
+		SessionDecisions:   []ui.SessionDecision{ui.SessionStop},
+	}
+
+	stateMgr := state.NewManager(t.TempDir())
+	orch := New(cfg, spawner, prompter, taskStore, stateMgr)
+
+	orch.SetRecoveryState(&state.OrchestratorState{
+		SessionID: "ses-crashed2",
+		WaveCycle: 1,
+		Phase:     "development",
+	})
+
+	err := orch.Run(context.Background(), "ignored")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// After recovery, the previously claimed task should have been
+	// reset to pending and then processed. Verify it's not stuck in claimed.
+	task := taskStore.FindTask("task-001")
+	if task == nil {
+		t.Fatal("task-001 not found")
+	}
+	if task.Status == tasks.StatusClaimed {
+		t.Error("task-001 should not still be claimed after recovery")
+	}
+	// It should be done or merged (processed successfully)
+	if task.Status != tasks.StatusDone && task.Status != tasks.StatusMerged {
+		t.Errorf("task-001 status = %q, want done or merged", task.Status)
+	}
+}
+
 func TestEmptyPlanHandled(t *testing.T) {
 	cfg := testOrchestratorConfig(t)
 

@@ -11,6 +11,11 @@ import (
 	"github.com/kylegalloway/blueflame/internal/tasks"
 )
 
+// DefaultWatcherTemplate returns the built-in watcher hook template.
+func DefaultWatcherTemplate() *template.Template {
+	return template.Must(template.New("watcher.sh").Parse(watcherTemplateSource))
+}
+
 // WatcherData holds all data needed to render the watcher hook script.
 type WatcherData struct {
 	AgentID            string
@@ -53,6 +58,9 @@ func GenerateWatcherHook(tmplPath string, data WatcherData, outputPath string) e
 
 // GenerateWatcherHookFromTemplate generates the watcher from an already-parsed template.
 func GenerateWatcherHookFromTemplate(tmpl *template.Template, data WatcherData, outputPath string) error {
+	if tmpl == nil {
+		return fmt.Errorf("watcher template is nil")
+	}
 	if err := os.MkdirAll(filepath.Dir(outputPath), 0o755); err != nil {
 		return fmt.Errorf("create hook dir: %w", err)
 	}

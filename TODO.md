@@ -32,7 +32,7 @@
 
 ## Medium (polish / completeness)
 
-- [ ] **Re-plan is a stub** — Both `PlanReplan` and `SessionReplan` just return `ErrPlanRejected`.
+- [ ] **Session re-plan is a stub** — `PlanReplan` works (appends feedback to prior context, re-enters planning loop), but `SessionReplan` just returns `ErrPlanRejected` instead of re-entering the planning phase mid-session. (`internal/orchestrator/orchestrator.go:212`)
 
 - [ ] **Crash recovery resume** — Detects recovery state but always starts fresh. No resume from saved wave/phase.
 
@@ -45,3 +45,35 @@
 - [x] **Interactive planning** — Planner spawner now checks `cfg.Planning.Interactive` and omits `--print` flag when interactive mode is enabled.
 
 - [ ] **No worktree cleanup on success** — Worktrees only cleaned via `blueflame cleanup` command, not on successful session completion.
+
+## High-Medium (functional gaps in implemented code)
+
+- [ ] **Validator receives empty diff and audit summary** — `runValidation()` passes empty strings for both `diff` and `auditSummary` to `SpawnValidator()`. Validators have no context about what the worker actually changed. Should compute `git diff base..branch` and summarize the agent's audit log. (`internal/orchestrator/orchestrator.go:502`)
+
+- [ ] **PostCheck silently passes when no commits exist** — `gitDiffNameStatus()` returns `nil, nil` when git diff fails (e.g., no commits on the branch), causing postcheck to pass silently instead of flagging that the worker produced no output. (`internal/agent/postcheck.go:65`)
+
+## Low (plan features not yet implemented)
+
+- [ ] **Post-execution git commit verification** — Plan specifies `git log --oneline base_branch..agent_branch` to verify commits exist after worker completes. Not implemented in postcheck. (`internal/agent/postcheck.go`)
+
+- [ ] **Sensitive content detection in postcheck** — Plan specifies `containsSensitiveContent()` to detect secrets, keys, and tokens in modified files. Not implemented. (`internal/agent/postcheck.go`)
+
+- [ ] **End-to-end test infrastructure** — Plan specifies `test/e2e/` directory with 5 E2E tests using real `claude --print` against a test repo. Directory does not exist.
+
+- [ ] **Max re-plan attempts** — Plan specifies max 3 re-plan attempts, then suggest manual plan writing. No limit exists (re-plan itself is stubbed). (`internal/orchestrator/orchestrator.go`)
+
+- [ ] **Re-plan rejection notes** — Plan specifies passing human's rejection notes to next planner invocation via `ReplanNotes` template variable. Not implemented (re-plan is stubbed). (`internal/orchestrator/planner.go`)
+
+- [ ] **Memory decay config passthrough** — Plan specifies `decay_policy.summarize_after_sessions` and `preserve_failures_sessions` passed to BeadsProvider. Config is parsed but BeadsProvider does not receive or use decay policy. (`cmd/blueflame/main.go`, `internal/memory/beads.go`)
+
+- [ ] **Budget warn threshold** — Plan specifies warning at 80% of budget (`warn_threshold: 0.8`). Config field exists but threshold is never checked; only the 100% circuit breaker fires. (`internal/orchestrator/orchestrator.go`)
+
+- [ ] **Validator diagnostic commands in spawner/prompt** — Watcher template restricts validator bash to diagnostic commands, but commands list is not passed to the validator's system prompt so the validator doesn't know which commands to run. (`internal/agent/spawner.go`, prompt templates)
+
+- [ ] **Merge conflict detection after changeset merge** — Plan specifies detecting conflicts when merging approved changesets to base branch in sequence, re-queuing conflicting changesets for next cycle. Not implemented. (`internal/orchestrator/orchestrator.go`)
+
+- [ ] **Config drift detection between wave cycles** — Plan specifies detecting and warning if `blueflame.yaml` changes between wave cycles. Not implemented. (`internal/orchestrator/orchestrator.go`)
+
+- [ ] **Task history size bounding** — Plan verification test #47 specifies history stays bounded across multiple re-queues. No max history entries enforced. (`internal/tasks/tasks.go`)
+
+- [ ] **Per-agent token budget monitoring goroutine** — Plan specifies `monitorAgentTokens()` goroutine that periodically checks agent's cumulative token usage from JSON output and kills the agent if exceeded. Spawner passes `--max-tokens` flag but orchestrator does not actively monitor token-based budgets. (`internal/orchestrator/worker.go`)

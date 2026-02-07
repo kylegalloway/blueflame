@@ -51,6 +51,11 @@ func (m *Manager) Create(agentID, taskID string) (string, string, error) {
 		return "", "", fmt.Errorf("create worktree parent dir: %w", err)
 	}
 
+	// Ensure the base branch exists (handles empty repos with no commits).
+	if err := m.ensureBaseBranch(); err != nil {
+		return "", "", fmt.Errorf("ensure base branch: %w", err)
+	}
+
 	cmd := exec.Command("git", "worktree", "add", "-b", branch, wtPath, m.baseBranch)
 	cmd.Dir = m.repoDir
 	output, err := cmd.CombinedOutput()
@@ -59,6 +64,41 @@ func (m *Manager) Create(agentID, taskID string) (string, string, error) {
 	}
 
 	return wtPath, branch, nil
+}
+
+// ensureBaseBranch creates the base branch with an initial commit if the repo has no commits.
+func (m *Manager) ensureBaseBranch() error {
+	// Check if the base branch ref exists.
+	cmd := exec.Command("git", "rev-parse", "--verify", m.baseBranch)
+	cmd.Dir = m.repoDir
+	if err := cmd.Run(); err == nil {
+		return nil // branch exists
+	}
+
+	// No base branch — create an initial empty commit.
+	commitCmd := exec.Command("git", "commit", "--allow-empty", "-m", "Initial commit (blueflame)")
+	commitCmd.Dir = m.repoDir
+	if output, err := commitCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("create initial commit: %s: %w", strings.TrimSpace(string(output)), err)
+	}
+
+	// If the default branch isn't our base branch, rename it.
+	headCmd := exec.Command("git", "symbolic-ref", "--short", "HEAD")
+	headCmd.Dir = m.repoDir
+	headOut, err := headCmd.Output()
+	if err != nil {
+		return nil // commit was created, branch naming is best-effort
+	}
+	currentBranch := strings.TrimSpace(string(headOut))
+	if currentBranch != m.baseBranch {
+		renameCmd := exec.Command("git", "branch", "-m", currentBranch, m.baseBranch)
+		renameCmd.Dir = m.repoDir
+		if output, err := renameCmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("rename branch to %s: %s: %w", m.baseBranch, strings.TrimSpace(string(output)), err)
+		}
+	}
+
+	return nil
 }
 
 // Remove removes a git worktree and its branch.

@@ -6,6 +6,8 @@ import (
 	"io"
 	"os"
 	"strings"
+
+	"github.com/kylegalloway/blueflame/internal/state"
 )
 
 // PlanDecision represents the human's decision on a proposed plan.
@@ -34,6 +36,14 @@ const (
 	SessionContinue SessionDecision = iota
 	SessionReplan
 	SessionStop
+)
+
+// CrashRecoveryDecision represents the human's decision when a previous session is found.
+type CrashRecoveryDecision int
+
+const (
+	RecoveryResume CrashRecoveryDecision = iota
+	RecoveryFresh
 )
 
 // ValidatorFailureDecision represents the human's decision when a validator fails.
@@ -75,10 +85,11 @@ type SessionState struct {
 
 // Prompter is the interface for human interaction.
 type Prompter interface {
-	PlanApproval(taskCount int, estimatedCost string) PlanDecision
+	PlanApproval(taskCount int, estimatedCost string) (PlanDecision, string)
 	ChangesetReview(cs ChangesetInfo) (ChangesetDecision, string)
 	SessionContinuation(state SessionState) SessionDecision
 	ValidatorFailed(taskID string, err error) ValidatorFailureDecision
+	CrashRecoveryPrompt(rs *state.OrchestratorState) CrashRecoveryDecision
 	Warn(msg string)
 	Info(msg string)
 }
@@ -97,20 +108,22 @@ func NewTerminalPrompter() *TerminalPrompter {
 	}
 }
 
-func (p *TerminalPrompter) PlanApproval(taskCount int, estimatedCost string) PlanDecision {
+func (p *TerminalPrompter) PlanApproval(taskCount int, estimatedCost string) (PlanDecision, string) {
 	fmt.Fprintf(p.writer, "\n(a)pprove / (e)dit tasks.yaml / (r)e-plan / (q)uit? ")
 	line, _ := p.reader.ReadString('\n')
 	switch strings.TrimSpace(strings.ToLower(line)) {
 	case "a", "approve":
-		return PlanApprove
+		return PlanApprove, ""
 	case "e", "edit":
-		return PlanEdit
+		return PlanEdit, ""
 	case "r", "re-plan", "replan":
-		return PlanReplan
+		fmt.Fprintf(p.writer, "What should change? ")
+		feedback, _ := p.reader.ReadString('\n')
+		return PlanReplan, strings.TrimSpace(feedback)
 	case "q", "quit":
-		return PlanAbort
+		return PlanAbort, ""
 	default:
-		return PlanAbort
+		return PlanAbort, ""
 	}
 }
 
@@ -194,6 +207,20 @@ func (p *TerminalPrompter) ValidatorFailed(taskID string, err error) ValidatorFa
 	}
 }
 
+func (p *TerminalPrompter) CrashRecoveryPrompt(rs *state.OrchestratorState) CrashRecoveryDecision {
+	fmt.Fprintf(p.writer, "\nPrevious session found: %s\n", rs.SessionID)
+	fmt.Fprintf(p.writer, "  Wave cycle: %d, phase: %s\n", rs.WaveCycle, rs.Phase)
+	fmt.Fprintf(p.writer, "  Cost so far: $%.2f (%d tokens)\n", rs.SessionCost, rs.SessionTokens)
+	fmt.Fprintf(p.writer, "\n(r)esume / (f)resh? ")
+	line, _ := p.reader.ReadString('\n')
+	switch strings.TrimSpace(strings.ToLower(line)) {
+	case "r", "resume":
+		return RecoveryResume
+	default:
+		return RecoveryFresh
+	}
+}
+
 func (p *TerminalPrompter) Warn(msg string) {
 	fmt.Fprintf(p.writer, "WARNING: %s\n", msg)
 }
@@ -208,22 +235,29 @@ type ScriptedPrompter struct {
 	ChangesetDecisions []ChangesetDecision
 	SessionDecisions   []SessionDecision
 	ValidatorDecisions []ValidatorFailureDecision
+	RecoveryDecisions  []CrashRecoveryDecision
 	RejectionReasons   []string
+	ReplanFeedback     []string
 	Messages           []string
 
 	planIdx      int
 	changesetIdx int
 	sessionIdx   int
 	validatorIdx int
+	recoveryIdx  int
 }
 
-func (p *ScriptedPrompter) PlanApproval(taskCount int, estimatedCost string) PlanDecision {
+func (p *ScriptedPrompter) PlanApproval(taskCount int, estimatedCost string) (PlanDecision, string) {
 	if p.planIdx < len(p.PlanDecisions) {
 		d := p.PlanDecisions[p.planIdx]
+		var feedback string
+		if d == PlanReplan && p.planIdx < len(p.ReplanFeedback) {
+			feedback = p.ReplanFeedback[p.planIdx]
+		}
 		p.planIdx++
-		return d
+		return d, feedback
 	}
-	return PlanAbort
+	return PlanAbort, ""
 }
 
 func (p *ScriptedPrompter) ChangesetReview(cs ChangesetInfo) (ChangesetDecision, string) {
@@ -258,6 +292,15 @@ func (p *ScriptedPrompter) ValidatorFailed(taskID string, err error) ValidatorFa
 		return d
 	}
 	return ValidatorSkipTask
+}
+
+func (p *ScriptedPrompter) CrashRecoveryPrompt(rs *state.OrchestratorState) CrashRecoveryDecision {
+	if p.recoveryIdx < len(p.RecoveryDecisions) {
+		d := p.RecoveryDecisions[p.recoveryIdx]
+		p.recoveryIdx++
+		return d
+	}
+	return RecoveryFresh
 }
 
 // NewScriptedPrompterFromFile creates a ScriptedPrompter by reading decisions from a file.
@@ -295,6 +338,10 @@ func NewScriptedPrompterFromFile(path string) *ScriptedPrompter {
 			p.SessionDecisions = append(p.SessionDecisions, SessionStop)
 		case "replan":
 			p.SessionDecisions = append(p.SessionDecisions, SessionReplan)
+		case "recovery-resume":
+			p.RecoveryDecisions = append(p.RecoveryDecisions, RecoveryResume)
+		case "recovery-fresh":
+			p.RecoveryDecisions = append(p.RecoveryDecisions, RecoveryFresh)
 		}
 	}
 	return p

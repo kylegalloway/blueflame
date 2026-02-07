@@ -45,11 +45,21 @@ type BranchInfo struct {
 
 // ClaudeOutput represents the JSON output from claude --print --output-format json.
 type ClaudeOutput struct {
-	Result       string  `json:"result"`
-	CostUSD      float64 `json:"cost_usd"`
-	InputTokens  int     `json:"input_tokens"`
-	OutputTokens int     `json:"output_tokens"`
-	Duration     float64 `json:"duration_seconds"`
+	Type         string       `json:"type"`
+	Subtype      string       `json:"subtype"`
+	Result       string       `json:"result"`
+	IsError      bool         `json:"is_error"`
+	TotalCostUSD float64      `json:"total_cost_usd"`
+	DurationMS   int          `json:"duration_ms"`
+	NumTurns     int          `json:"num_turns"`
+	Usage        ClaudeUsage  `json:"usage"`
+	SessionID    string       `json:"session_id"`
+}
+
+// ClaudeUsage represents token usage from claude CLI output.
+type ClaudeUsage struct {
+	InputTokens  int `json:"input_tokens"`
+	OutputTokens int `json:"output_tokens"`
 }
 
 // AgentResult holds the outcome of an agent execution.
@@ -367,8 +377,8 @@ func CollectResult(agent *Agent) AgentResult {
 		Output:    output,
 		RawStdout: agent.Stdout.Bytes(),
 		RawStderr: agent.Stderr.Bytes(),
-		CostUSD:   output.CostUSD,
-		TokensUsed: output.InputTokens + output.OutputTokens,
+		CostUSD:   output.TotalCostUSD,
+		TokensUsed: output.Usage.InputTokens + output.Usage.OutputTokens,
 		Duration:  time.Since(agent.Started),
 		Err:       err,
 	}
