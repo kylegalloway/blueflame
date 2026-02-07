@@ -1,0 +1,26 @@
+# Build output
+bin/
+blueflame
+
+# Runtime state (created by blueflame in project repos)
+.blueflame/
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment / secrets
+.env
+.env.*

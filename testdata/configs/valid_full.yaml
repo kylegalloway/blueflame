@@ -1,0 +1,122 @@
+schema_version: 1
+
+project:
+  name: "test-project"
+  repo: "/tmp/blueflame-test-repo"
+  base_branch: "main"
+  worktree_dir: ".trees"
+  tasks_file: ".blueflame/tasks.yaml"
+
+concurrency:
+  planning: 1
+  development: 4
+  validation: 2
+  merge: 1
+  adaptive: true
+  adaptive_min_ram_per_agent_mb: 600
+
+limits:
+  agent_timeout: 300s
+  heartbeat_interval: 30s
+  max_retries: 2
+  max_wave_cycles: 5
+  max_session_cost_usd: 10.00
+  max_session_tokens: 0
+  token_budget:
+    planner_usd: 0.40
+    planner_tokens: 0
+    worker_usd: 1.50
+    worker_tokens: 0
+    validator_usd: 0.15
+    validator_tokens: 0
+    merger_usd: 0.50
+    merger_tokens: 0
+    warn_threshold: 0.8
+
+sandbox:
+  max_cpu_seconds: 600
+  max_memory_mb: 2048
+  max_file_size_mb: 50
+  max_open_files: 1024
+  allow_network: false
+
+planning:
+  interactive: true
+
+models:
+  planner: "sonnet"
+  worker: "sonnet"
+  validator: "haiku"
+  merger: "sonnet"
+
+permissions:
+  allowed_paths:
+    - "src/**"
+    - "tests/**"
+  blocked_paths:
+    - ".env*"
+    - "*.secret"
+  allowed_tools:
+    - "Read"
+    - "Write"
+    - "Edit"
+    - "Glob"
+    - "Grep"
+    - "Bash"
+  blocked_tools:
+    - "WebFetch"
+    - "WebSearch"
+    - "Task"
+  bash_rules:
+    allowed_commands:
+      - "go test"
+      - "go build"
+      - "make"
+    blocked_patterns:
+      - "rm\\s+-rf"
+      - "git\\s+push"
+      - "curl|wget"
+
+validation:
+  commit_format:
+    pattern: "^(feat|fix|refactor|test|docs|chore)\\(task-\\d+\\): .+"
+    example: "feat(task-001): add JWT middleware"
+  file_naming:
+    style: "snake_case"
+    enforce_for:
+      - "src/**/*.go"
+  require_tests:
+    enabled: true
+    source_patterns:
+      - "src/**/*.go"
+    test_patterns:
+      - "tests/**/*_test.go"
+  file_scope:
+    enforce: true
+  validator_diagnostics:
+    enabled: true
+    commands:
+      - "go test ./..."
+      - "go vet ./..."
+    timeout: 120s
+
+superpowers:
+  enabled: true
+  skills:
+    - "test-driven-development"
+    - "brainstorm"
+
+beads:
+  enabled: true
+  archive_after_wave: true
+  include_failure_notes: true
+  memory_decay: true
+  decay_policy:
+    summarize_after_sessions: 3
+    preserve_failures_sessions: 5
+
+hooks:
+  post_plan: ""
+  pre_validation: ""
+  post_merge: ""
+  on_failure: ""

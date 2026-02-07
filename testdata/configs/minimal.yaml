@@ -1,0 +1,4 @@
+project:
+  name: "minimal-project"
+  repo: "/tmp/blueflame-test-repo"
+  base_branch: "main"
