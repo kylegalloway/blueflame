@@ -1,6 +1,6 @@
 # Build output
 bin/
-blueflame
+/blueflame
 
 # Runtime state (created by blueflame in project repos)
 .blueflame/
