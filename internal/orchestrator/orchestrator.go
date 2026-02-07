@@ -8,9 +8,12 @@ import (
 
 	"github.com/kylegalloway/blueflame/internal/agent"
 	"github.com/kylegalloway/blueflame/internal/config"
+	"github.com/kylegalloway/blueflame/internal/locks"
+	"github.com/kylegalloway/blueflame/internal/memory"
 	"github.com/kylegalloway/blueflame/internal/state"
 	"github.com/kylegalloway/blueflame/internal/tasks"
 	"github.com/kylegalloway/blueflame/internal/ui"
+	"github.com/kylegalloway/blueflame/internal/worktree"
 )
 
 var (
@@ -29,26 +32,54 @@ type Orchestrator struct {
 	state     *state.OrchestratorState
 	stateMgr  *state.Manager
 	lifecycle *agent.LifecycleManager
+	worktrees *worktree.Manager
+	locks     *locks.Manager
+	memory    memory.Provider
+	hooksDir  string
 
 	sessionCost   float64
 	sessionTokens int
+
+	// agentLocks tracks which lock paths each agent holds, for per-agent release.
+	agentLocks map[string][]string
 }
 
 // New creates a new Orchestrator.
 func New(cfg *config.Config, spawner agent.AgentSpawner, prompter ui.Prompter, taskStore *tasks.TaskStore, stateMgr *state.Manager) *Orchestrator {
 	concurrency := agent.EffectiveConcurrency(&cfg.Concurrency)
 	return &Orchestrator{
-		config:    cfg,
-		spawner:   spawner,
-		taskStore: taskStore,
-		scheduler: NewScheduler(concurrency),
-		ui:        prompter,
-		stateMgr:  stateMgr,
+		config:     cfg,
+		spawner:    spawner,
+		taskStore:  taskStore,
+		scheduler:  NewScheduler(concurrency),
+		ui:         prompter,
+		stateMgr:   stateMgr,
+		agentLocks: make(map[string][]string),
 		state: &state.OrchestratorState{
 			SessionID: fmt.Sprintf("ses-%s", time.Now().Format("20060102-150405")),
 			StartTime: time.Now(),
 		},
 	}
+}
+
+// SetWorktreeManager sets the worktree manager for creating agent worktrees.
+func (o *Orchestrator) SetWorktreeManager(wm *worktree.Manager) {
+	o.worktrees = wm
+}
+
+// SetLockManager sets the lock manager for file lock acquisition.
+func (o *Orchestrator) SetLockManager(lm *locks.Manager) {
+	o.locks = lm
+}
+
+// SetHooksDir sets the base directory for generated hook scripts.
+func (o *Orchestrator) SetHooksDir(dir string) {
+	o.hooksDir = dir
+}
+
+// SetMemoryProvider sets the memory provider for cross-session context.
+func (o *Orchestrator) SetMemoryProvider(mp memory.Provider) {
+	o.memory = mp
 }
 
 // SetLifecycleManager sets the lifecycle manager for agent tracking.
@@ -69,7 +100,19 @@ func (o *Orchestrator) Run(ctx context.Context, taskDescription string) error {
 	o.state.Phase = "planning"
 	o.persistState()
 
-	plan, err := o.runPlanning(ctx, taskDescription)
+	// Load prior session context for planner
+	var priorContext string
+	if o.memory != nil {
+		if memCtx, loadErr := o.memory.Load(); loadErr == nil && memCtx.SessionCount > 0 {
+			priorContext = fmt.Sprintf("Prior sessions: %d. Prior failures: %d.",
+				memCtx.SessionCount, len(memCtx.PriorFailures))
+			for _, f := range memCtx.PriorFailures {
+				priorContext += fmt.Sprintf("\n- Task %s (%s): %s", f.ID, f.Title, f.FailureReason)
+			}
+		}
+	}
+
+	plan, err := o.runPlanning(ctx, taskDescription, priorContext)
 	if err != nil {
 		return fmt.Errorf("planning: %w", err)
 	}
@@ -129,7 +172,7 @@ func (o *Orchestrator) Run(ctx context.Context, taskDescription string) error {
 		o.state.Phase = "merge"
 		o.persistState()
 		changesets := o.collectChangesets()
-		approved, requeued := o.presentChangesets(changesets)
+		approved, requeued := o.presentChangesets(ctx, changesets)
 
 		// Check if more work remains
 		if !o.hasRemainingTasks() {
@@ -150,6 +193,11 @@ func (o *Orchestrator) Run(ctx context.Context, taskDescription string) error {
 		}
 	}
 
+	// Save session to memory provider
+	if o.memory != nil {
+		o.saveSessionMemory()
+	}
+
 	// Clean up state file on successful completion
 	if o.stateMgr != nil {
 		o.stateMgr.Remove()
@@ -158,8 +206,40 @@ func (o *Orchestrator) Run(ctx context.Context, taskDescription string) error {
 	return nil
 }
 
-func (o *Orchestrator) runPlanning(ctx context.Context, description string) ([]tasks.Task, error) {
-	plannerAgent, err := o.spawner.SpawnPlanner(ctx, description, "", o.config)
+func (o *Orchestrator) saveSessionMemory() {
+	allTasks := o.taskStore.Tasks()
+	result := memory.SessionResult{
+		ID:           o.state.SessionID,
+		TotalCostUSD: o.sessionCost,
+		TotalTokens:  o.sessionTokens,
+		WaveCycles:   o.state.WaveCycle,
+	}
+	for _, t := range allTasks {
+		summary := memory.TaskSummary{
+			ID:           t.ID,
+			Title:        t.Title,
+			ResultStatus: string(t.Status),
+			RetryCount:   t.RetryCount,
+		}
+		if t.Result.Status != "" {
+			summary.ValidatorNotes = t.Result.Notes
+		}
+		result.AllTasks = append(result.AllTasks, summary)
+		switch t.Status {
+		case tasks.StatusMerged, tasks.StatusDone:
+			result.CompletedTasks = append(result.CompletedTasks, summary)
+		case tasks.StatusFailed:
+			summary.FailureReason = t.Result.Notes
+			result.FailedTasks = append(result.FailedTasks, summary)
+		}
+	}
+	if err := o.memory.Save(result); err != nil {
+		o.ui.Warn(fmt.Sprintf("save session memory: %v", err))
+	}
+}
+
+func (o *Orchestrator) runPlanning(ctx context.Context, description string, priorContext string) ([]tasks.Task, error) {
+	plannerAgent, err := o.spawner.SpawnPlanner(ctx, description, priorContext, o.config)
 	if err != nil {
 		return nil, fmt.Errorf("spawn planner: %w", err)
 	}
@@ -208,6 +288,7 @@ func (o *Orchestrator) runDevelopment(ctx context.Context) []agent.AgentResult {
 	}
 
 	var results []agent.AgentResult
+	spawned := 0
 	resultCh := make(chan agent.AgentResult, len(ready))
 
 	for i := range ready {
@@ -217,14 +298,72 @@ func (o *Orchestrator) runDevelopment(ctx context.Context) []agent.AgentResult {
 		}
 
 		agentID := fmt.Sprintf("worker-%08x", time.Now().UnixNano()&0xFFFFFFFF)
-		if err := task.Claim(agentID, "/tmp/wt-"+task.ID, "blueflame/"+task.ID); err != nil {
+		branch := worktree.BranchName(task.ID)
+
+		// Create worktree
+		var wtPath string
+		if o.worktrees != nil {
+			var err error
+			wtPath, _, err = o.worktrees.Create(agentID, task.ID)
+			if err != nil {
+				o.ui.Warn(fmt.Sprintf("worktree create for %s: %v", task.ID, err))
+				continue
+			}
+		} else {
+			wtPath = "/tmp/wt-" + task.ID
+		}
+
+		// Acquire file locks
+		if o.locks != nil && len(task.FileLocks) > 0 {
+			if err := o.locks.Acquire(agentID, task.FileLocks); err != nil {
+				o.ui.Warn(fmt.Sprintf("lock conflict for %s: %v", task.ID, err))
+				// Rollback worktree
+				if o.worktrees != nil {
+					o.worktrees.Remove(agentID)
+				}
+				continue
+			}
+			o.agentLocks[agentID] = task.FileLocks
+		}
+
+		// Generate watcher hooks and .claude/settings.json
+		if o.hooksDir != "" {
+			hookData := agent.BuildWatcherData(agentID, agent.RoleWorker, task, o.config, o.hooksDir)
+			hookPath := fmt.Sprintf("%s/%s-watcher.sh", o.hooksDir, agentID)
+			if err := agent.GenerateWatcherHookFromTemplate(nil, hookData, hookPath); err != nil {
+				// Non-fatal: log and continue without hooks
+				o.ui.Warn(fmt.Sprintf("generate hooks for %s: %v", task.ID, err))
+			} else {
+				if err := agent.GenerateAgentSettings(wtPath, hookPath); err != nil {
+					o.ui.Warn(fmt.Sprintf("generate settings for %s: %v", task.ID, err))
+				}
+			}
+		}
+
+		if err := task.Claim(agentID, wtPath, branch); err != nil {
+			// Rollback
+			if o.locks != nil {
+				o.locks.Release(agentID)
+				delete(o.agentLocks, agentID)
+			}
+			if o.worktrees != nil {
+				o.worktrees.Remove(agentID)
+			}
 			continue
 		}
 
 		workerAgent, err := o.spawner.SpawnWorker(ctx, task, o.config)
 		if err != nil {
-			task.Status = tasks.StatusPending // Unclaim on spawn failure
+			task.Status = tasks.StatusPending
 			task.AgentID = ""
+			// Rollback
+			if o.locks != nil {
+				o.locks.Release(agentID)
+				delete(o.agentLocks, agentID)
+			}
+			if o.worktrees != nil {
+				o.worktrees.Remove(agentID)
+			}
 			continue
 		}
 
@@ -233,6 +372,7 @@ func (o *Orchestrator) runDevelopment(ctx context.Context) []agent.AgentResult {
 			o.lifecycle.Register(workerAgent)
 		}
 
+		spawned++
 		go func(a *agent.Agent) {
 			result := agent.CollectResult(a)
 			if o.lifecycle != nil {
@@ -243,7 +383,7 @@ func (o *Orchestrator) runDevelopment(ctx context.Context) []agent.AgentResult {
 	}
 
 	// Collect results
-	for i := 0; i < cap(resultCh); i++ {
+	for i := 0; i < spawned; i++ {
 		select {
 		case result := <-resultCh:
 			results = append(results, result)
@@ -264,20 +404,47 @@ func (o *Orchestrator) handleDevelopmentResults(results []agent.AgentResult) {
 			continue
 		}
 
+		// Release per-agent locks
+		o.releaseAgentLocks(result.AgentID)
+
 		if result.ExitCode == 0 {
-			task.Complete()
+			// Run postcheck to validate filesystem changes
+			postResult, err := agent.PostCheck(task, o.config)
+			if err != nil {
+				o.ui.Warn(fmt.Sprintf("postcheck error for %s: %v", task.ID, err))
+				task.Complete()
+			} else if !postResult.Pass {
+				var violations []string
+				for _, v := range postResult.Violations {
+					violations = append(violations, fmt.Sprintf("%s: %s", v.Type, v.Path))
+				}
+				task.Fail(fmt.Sprintf("postcheck violations: %v", violations))
+				if task.RetryCount < o.config.Limits.MaxRetries {
+					task.Requeue("postcheck failure", tasks.HistoryEntry{
+						Attempt:    task.RetryCount + 1,
+						AgentID:    result.AgentID,
+						Timestamp:  time.Now(),
+						Result:     "postcheck_failed",
+						Notes:      fmt.Sprintf("violations: %v", violations),
+						CostUSD:    result.CostUSD,
+						TokensUsed: result.TokensUsed,
+					})
+				}
+			} else {
+				task.Complete()
+			}
 		} else {
 			task.Fail(fmt.Sprintf("exit code %d", result.ExitCode))
 
 			// Check retries
 			if task.RetryCount < o.config.Limits.MaxRetries {
 				task.Requeue("automatic retry", tasks.HistoryEntry{
-					Attempt:   task.RetryCount + 1,
-					AgentID:   result.AgentID,
-					Timestamp: time.Now(),
-					Result:    "failed",
-					Notes:     fmt.Sprintf("exit code %d", result.ExitCode),
-					CostUSD:   result.CostUSD,
+					Attempt:    task.RetryCount + 1,
+					AgentID:    result.AgentID,
+					Timestamp:  time.Now(),
+					Result:     "failed",
+					Notes:      fmt.Sprintf("exit code %d", result.ExitCode),
+					CostUSD:    result.CostUSD,
 					TokensUsed: result.TokensUsed,
 				})
 			} else {
@@ -285,6 +452,17 @@ func (o *Orchestrator) handleDevelopmentResults(results []agent.AgentResult) {
 				tasks.CascadeFailure(task.ID, o.taskStore.Tasks())
 			}
 		}
+	}
+}
+
+// releaseAgentLocks releases file locks held by a specific agent.
+func (o *Orchestrator) releaseAgentLocks(agentID string) {
+	if o.locks == nil {
+		return
+	}
+	if _, ok := o.agentLocks[agentID]; ok {
+		o.locks.Release(agentID)
+		delete(o.agentLocks, agentID)
 	}
 }
 
@@ -316,6 +494,25 @@ func (o *Orchestrator) handleValidationResults(results []agent.AgentResult) {
 
 		task := o.taskStore.FindTask(result.TaskID)
 		if task == nil {
+			continue
+		}
+
+		if result.ExitCode != 0 {
+			decision := o.ui.ValidatorFailed(task.ID, fmt.Errorf("exit code %d", result.ExitCode))
+			switch decision {
+			case ui.ValidatorRetryTask:
+				task.Requeue("validator retry", tasks.HistoryEntry{
+					Attempt:   task.RetryCount + 1,
+					AgentID:   result.AgentID,
+					Timestamp: time.Now(),
+					Result:    "validator_failed",
+					Notes:     fmt.Sprintf("exit code %d, user chose retry", result.ExitCode),
+				})
+			case ui.ValidatorSkipTask:
+				task.Fail("validator failed, skipped by user")
+			case ui.ValidatorManualReview:
+				task.SetValidationResult("manual_review", "awaiting manual review")
+			}
 			continue
 		}
 
@@ -362,7 +559,7 @@ func (o *Orchestrator) collectChangesets() []Changeset {
 	return result
 }
 
-func (o *Orchestrator) presentChangesets(changesets []Changeset) (approved, requeued int) {
+func (o *Orchestrator) presentChangesets(ctx context.Context, changesets []Changeset) (approved, requeued int) {
 	for i, cs := range changesets {
 		info := ui.ChangesetInfo{
 			Index:         i + 1,
@@ -375,6 +572,33 @@ func (o *Orchestrator) presentChangesets(changesets []Changeset) (approved, requ
 		decision, reason := o.ui.ChangesetReview(info)
 		switch decision {
 		case ui.ChangesetApprove:
+			// Spawn merger to actually merge the branches
+			var branches []agent.BranchInfo
+			for _, taskID := range cs.TaskIDs {
+				if task := o.taskStore.FindTask(taskID); task != nil {
+					branches = append(branches, agent.BranchInfo{
+						Name:      task.Branch,
+						TaskID:    task.ID,
+						TaskTitle: task.Title,
+					})
+				}
+			}
+
+			if len(branches) > 0 {
+				mergerAgent, err := o.spawner.SpawnMerger(ctx, branches, o.config)
+				if err != nil {
+					o.ui.Warn(fmt.Sprintf("merge failed for group %s: %v", cs.CohesionGroup, err))
+					continue
+				}
+				mergeResult := agent.CollectResult(mergerAgent)
+				o.accumulateCost(mergeResult)
+
+				if mergeResult.ExitCode != 0 {
+					o.ui.Warn(fmt.Sprintf("merger exited %d for group %s", mergeResult.ExitCode, cs.CohesionGroup))
+					continue
+				}
+			}
+
 			approved++
 			for _, taskID := range cs.TaskIDs {
 				if task := o.taskStore.FindTask(taskID); task != nil {
@@ -464,6 +688,31 @@ func (o *Orchestrator) buildSessionState(approved, requeued int) ui.SessionState
 		TokensUsed:    o.sessionTokens,
 		TokenLimit:    o.config.Limits.MaxSessionTokens,
 		RequeuedTasks: requeuedTasks,
+	}
+}
+
+// SessionSummary returns the accumulated session results for cost summary display.
+func (o *Orchestrator) SessionSummary() ui.CostSummary {
+	allTasks := o.taskStore.Tasks()
+	var completed, failed, merged int
+	for _, t := range allTasks {
+		switch t.Status {
+		case tasks.StatusDone:
+			completed++
+		case tasks.StatusFailed:
+			failed++
+		case tasks.StatusMerged:
+			merged++
+		}
+	}
+	return ui.CostSummary{
+		SessionID:      o.state.SessionID,
+		TotalCost:      o.sessionCost,
+		TotalTokens:    o.sessionTokens,
+		WaveCycles:     o.state.WaveCycle,
+		TasksCompleted: completed,
+		TasksFailed:    failed,
+		TasksMerged:    merged,
 	}
 }
 

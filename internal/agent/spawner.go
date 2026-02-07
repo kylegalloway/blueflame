@@ -105,10 +105,36 @@ func (s *ProductionSpawner) SpawnWorker(ctx context.Context, task *tasks.Task, c
 	budget := cfg.Limits.TokenBudget.WorkerBudget()
 	if budget.Unit == config.USD && budget.Value > 0 {
 		args = append(args, "--max-budget-usd", fmt.Sprintf("%.2f", budget.Value))
+	} else if budget.Unit == config.Tokens && budget.Value > 0 {
+		args = append(args, "--max-tokens", fmt.Sprintf("%.0f", budget.Value))
 	}
 
-	// The prompt would be rendered from template in production
-	args = append(args, fmt.Sprintf("Implement task %s: %s", task.ID, task.Title))
+	// Render system prompt
+	if s.PromptRenderer != nil {
+		sysPrompt, err := s.PromptRenderer.RenderSystemPrompt(RoleWorker, nil)
+		if err == nil && sysPrompt != "" {
+			args = append(args, "--system-prompt", sysPrompt)
+		}
+	}
+
+	// Render task prompt
+	prompt := fmt.Sprintf("Implement task %s: %s", task.ID, task.Title)
+	if s.PromptRenderer != nil {
+		var retryNotes string
+		if len(task.History) > 0 {
+			last := task.History[len(task.History)-1]
+			retryNotes = last.Notes
+		}
+		rendered, err := s.PromptRenderer.RenderPrompt(RoleWorker, WorkerPromptData{
+			Task:       task,
+			FileLocks:  task.FileLocks,
+			RetryNotes: retryNotes,
+		})
+		if err == nil {
+			prompt = rendered
+		}
+	}
+	args = append(args, prompt)
 
 	cmd := exec.CommandContext(ctx, "claude", args...)
 	cmd.Dir = task.Worktree
@@ -141,12 +167,40 @@ func (s *ProductionSpawner) SpawnPlanner(ctx context.Context, description string
 		"--output-format", "json",
 	}
 
+	if cfg.Planning.Interactive {
+		// Remove --print for interactive mode
+		args = args[1:]
+	}
+
 	budget := cfg.Limits.TokenBudget.PlannerBudget()
 	if budget.Unit == config.USD && budget.Value > 0 {
 		args = append(args, "--max-budget-usd", fmt.Sprintf("%.2f", budget.Value))
+	} else if budget.Unit == config.Tokens && budget.Value > 0 {
+		args = append(args, "--max-tokens", fmt.Sprintf("%.0f", budget.Value))
 	}
 
-	args = append(args, description)
+	// Render system prompt
+	if s.PromptRenderer != nil {
+		sysPrompt, err := s.PromptRenderer.RenderSystemPrompt(RolePlanner, nil)
+		if err == nil && sysPrompt != "" {
+			args = append(args, "--system-prompt", sysPrompt)
+		}
+	}
+
+	// Render task prompt
+	prompt := description
+	if s.PromptRenderer != nil {
+		rendered, err := s.PromptRenderer.RenderPrompt(RolePlanner, PlannerPromptData{
+			Description:  description,
+			PriorContext: priorContext,
+			ProjectName:  cfg.Project.Name,
+			BaseBranch:   cfg.Project.BaseBranch,
+		})
+		if err == nil {
+			prompt = rendered
+		}
+	}
+	args = append(args, prompt)
 
 	cmd := exec.CommandContext(ctx, "claude", args...)
 	cmd.Dir = cfg.Project.Repo
@@ -183,9 +237,31 @@ func (s *ProductionSpawner) SpawnValidator(ctx context.Context, task *tasks.Task
 	budget := cfg.Limits.TokenBudget.ValidatorBudget()
 	if budget.Unit == config.USD && budget.Value > 0 {
 		args = append(args, "--max-budget-usd", fmt.Sprintf("%.2f", budget.Value))
+	} else if budget.Unit == config.Tokens && budget.Value > 0 {
+		args = append(args, "--max-tokens", fmt.Sprintf("%.0f", budget.Value))
 	}
 
-	args = append(args, fmt.Sprintf("Validate task %s: %s\n\nDiff:\n%s", task.ID, task.Title, diff))
+	// Render system prompt
+	if s.PromptRenderer != nil {
+		sysPrompt, err := s.PromptRenderer.RenderSystemPrompt(RoleValidator, nil)
+		if err == nil && sysPrompt != "" {
+			args = append(args, "--system-prompt", sysPrompt)
+		}
+	}
+
+	// Render task prompt
+	prompt := fmt.Sprintf("Validate task %s: %s\n\nDiff:\n%s", task.ID, task.Title, diff)
+	if s.PromptRenderer != nil {
+		rendered, err := s.PromptRenderer.RenderPrompt(RoleValidator, ValidatorPromptData{
+			Task:         task,
+			Diff:         diff,
+			AuditSummary: auditSummary,
+		})
+		if err == nil {
+			prompt = rendered
+		}
+	}
+	args = append(args, prompt)
 
 	cmd := exec.CommandContext(ctx, "claude", args...)
 	cmd.Dir = task.Worktree
@@ -221,14 +297,32 @@ func (s *ProductionSpawner) SpawnMerger(ctx context.Context, branches []BranchIn
 	budget := cfg.Limits.TokenBudget.MergerBudget()
 	if budget.Unit == config.USD && budget.Value > 0 {
 		args = append(args, "--max-budget-usd", fmt.Sprintf("%.2f", budget.Value))
+	} else if budget.Unit == config.Tokens && budget.Value > 0 {
+		args = append(args, "--max-tokens", fmt.Sprintf("%.0f", budget.Value))
 	}
 
+	// Render system prompt
+	if s.PromptRenderer != nil {
+		sysPrompt, err := s.PromptRenderer.RenderSystemPrompt(RoleMerger, nil)
+		if err == nil && sysPrompt != "" {
+			args = append(args, "--system-prompt", sysPrompt)
+		}
+	}
+
+	// Render task prompt
 	var desc strings.Builder
 	desc.WriteString("Merge the following validated branches:\n")
 	for _, b := range branches {
 		fmt.Fprintf(&desc, "- %s (task %s: %s)\n", b.Name, b.TaskID, b.TaskTitle)
 	}
-	args = append(args, desc.String())
+	prompt := desc.String()
+	if s.PromptRenderer != nil {
+		rendered, err := s.PromptRenderer.RenderPrompt(RoleMerger, MergerPromptData{Branches: branches})
+		if err == nil {
+			prompt = rendered
+		}
+	}
+	args = append(args, prompt)
 
 	cmd := exec.CommandContext(ctx, "claude", args...)
 	cmd.Dir = cfg.Project.Repo

@@ -12,16 +12,18 @@ import (
 
 // Manager handles advisory file locking via flock.
 type Manager struct {
-	lockDir string
-	held    map[string]*os.File // normalized path -> open file handle
-	mu      sync.Mutex
+	lockDir    string
+	held       map[string]*os.File  // normalized path -> open file handle
+	agentPaths map[string][]string  // agentID -> list of held paths
+	mu         sync.Mutex
 }
 
 // NewManager creates a lock Manager.
 func NewManager(lockDir string) *Manager {
 	return &Manager{
-		lockDir: lockDir,
-		held:    make(map[string]*os.File),
+		lockDir:    lockDir,
+		held:       make(map[string]*os.File),
+		agentPaths: make(map[string][]string),
 	}
 }
 
@@ -70,11 +72,33 @@ func (m *Manager) Acquire(agentID string, paths []string) error {
 		m.held[path] = f
 	}
 
+	m.agentPaths[agentID] = append(m.agentPaths[agentID], paths...)
 	return nil
 }
 
-// Release releases all locks held by an agent.
+// Release releases locks held by a specific agent.
 func (m *Manager) Release(agentID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	paths, ok := m.agentPaths[agentID]
+	if !ok {
+		return
+	}
+
+	for _, path := range paths {
+		if f, exists := m.held[path]; exists {
+			syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+			f.Close()
+			os.Remove(m.lockFilePath(path))
+			delete(m.held, path)
+		}
+	}
+	delete(m.agentPaths, agentID)
+}
+
+// ReleaseAll releases all held locks.
+func (m *Manager) ReleaseAll() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -84,11 +108,7 @@ func (m *Manager) Release(agentID string) {
 		os.Remove(m.lockFilePath(path))
 		delete(m.held, path)
 	}
-}
-
-// ReleaseAll releases all held locks.
-func (m *Manager) ReleaseAll() {
-	m.Release("")
+	m.agentPaths = make(map[string][]string)
 }
 
 // IsHeld returns true if the given path is currently locked.

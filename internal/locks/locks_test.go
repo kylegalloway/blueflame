@@ -254,6 +254,64 @@ func searchString(s, substr string) bool {
 	return false
 }
 
+func TestPerAgentRelease(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(filepath.Join(dir, "locks"))
+
+	// Two agents acquire different paths
+	err := mgr.Acquire("agent-1", []string{"pkg/a/"})
+	if err != nil {
+		t.Fatalf("Acquire agent-1: %v", err)
+	}
+	err = mgr.Acquire("agent-2", []string{"pkg/b/"})
+	if err != nil {
+		t.Fatalf("Acquire agent-2: %v", err)
+	}
+
+	// Release only agent-1's locks
+	mgr.Release("agent-1")
+
+	// agent-1's path should be free
+	if mgr.IsHeld("pkg/a/") {
+		t.Error("pkg/a/ should not be held after agent-1 release")
+	}
+
+	// agent-2's path should still be held
+	if !mgr.IsHeld("pkg/b/") {
+		t.Error("pkg/b/ should still be held by agent-2")
+	}
+
+	// A new agent should be able to acquire agent-1's old path
+	mgr3 := NewManager(filepath.Join(dir, "locks"))
+	err = mgr3.Acquire("agent-3", []string{"pkg/a/"})
+	if err != nil {
+		t.Fatalf("Acquire agent-3 after agent-1 release: %v", err)
+	}
+	mgr3.Release("agent-3")
+
+	mgr.Release("agent-2")
+}
+
+func TestReleaseNonexistentAgent(t *testing.T) {
+	mgr := NewManager(t.TempDir())
+	// Should not panic
+	mgr.Release("nonexistent")
+}
+
+func TestReleaseAllWithMultipleAgents(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(filepath.Join(dir, "locks"))
+
+	mgr.Acquire("agent-1", []string{"pkg/a/"})
+	mgr.Acquire("agent-2", []string{"pkg/b/"})
+
+	mgr.ReleaseAll()
+
+	if mgr.IsHeld("pkg/a/") || mgr.IsHeld("pkg/b/") {
+		t.Error("all locks should be released after ReleaseAll")
+	}
+}
+
 // Verify flock is actually providing OS-level enforcement
 func TestFlockActuallyWorks(t *testing.T) {
 	dir := t.TempDir()
