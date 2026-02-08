@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/kylegalloway/blueflame/internal/config"
@@ -104,10 +103,16 @@ func (s *ProductionSpawner) SpawnWorker(ctx context.Context, task *tasks.Task, c
 		return nil, fmt.Errorf("task %s has no agent_id", task.ID)
 	}
 
+	allowedTools := append([]string{}, cfg.Permissions.AllowedTools...)
+	// Wire superpowers skills as additional allowed tools
+	if cfg.Superpowers.Enabled && len(cfg.Superpowers.Skills) > 0 {
+		allowedTools = append(allowedTools, cfg.Superpowers.Skills...)
+	}
+
 	args := []string{
 		"--print",
 		"--model", cfg.Models.Worker,
-		"--allowed-tools", strings.Join(cfg.Permissions.AllowedTools, ","),
+		"--allowed-tools", strings.Join(allowedTools, ","),
 		"--disallowed-tools", strings.Join(cfg.Permissions.BlockedTools, ","),
 		"--output-format", "json",
 	}
@@ -148,11 +153,12 @@ func (s *ProductionSpawner) SpawnWorker(ctx context.Context, task *tasks.Task, c
 
 	cmd := exec.CommandContext(ctx, "claude", args...)
 	cmd.Dir = task.Worktree
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
+
+	applySandboxLimits(cmd, cfg.Sandbox)
 
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start worker: %w", err)
@@ -214,11 +220,12 @@ func (s *ProductionSpawner) SpawnPlanner(ctx context.Context, description string
 
 	cmd := exec.CommandContext(ctx, "claude", args...)
 	cmd.Dir = cfg.Project.Repo
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
+
+	applySandboxLimits(cmd, cfg.Sandbox)
 
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start planner: %w", err)
@@ -262,10 +269,15 @@ func (s *ProductionSpawner) SpawnValidator(ctx context.Context, task *tasks.Task
 	// Render task prompt
 	prompt := fmt.Sprintf("Validate task %s: %s\n\nDiff:\n%s", task.ID, task.Title, diff)
 	if s.PromptRenderer != nil {
+		var diagCmds []string
+		if cfg.Validation.ValidatorDiagnostics.Enabled {
+			diagCmds = cfg.Validation.ValidatorDiagnostics.Commands
+		}
 		rendered, err := s.PromptRenderer.RenderPrompt(RoleValidator, ValidatorPromptData{
-			Task:         task,
-			Diff:         diff,
-			AuditSummary: auditSummary,
+			Task:               task,
+			Diff:               diff,
+			AuditSummary:       auditSummary,
+			DiagnosticCommands: diagCmds,
 		})
 		if err == nil {
 			prompt = rendered
@@ -275,11 +287,12 @@ func (s *ProductionSpawner) SpawnValidator(ctx context.Context, task *tasks.Task
 
 	cmd := exec.CommandContext(ctx, "claude", args...)
 	cmd.Dir = task.Worktree
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
+
+	applySandboxLimits(cmd, cfg.Sandbox)
 
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start validator: %w", err)
@@ -345,11 +358,12 @@ func (s *ProductionSpawner) SpawnMerger(ctx context.Context, branches []BranchIn
 
 	cmd := exec.CommandContext(ctx, "claude", args...)
 	cmd.Dir = cfg.Project.Repo
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
+
+	applySandboxLimits(cmd, cfg.Sandbox)
 
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start merger: %w", err)

@@ -2,8 +2,11 @@ package orchestrator
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os/exec"
 	"strings"
 	"text/template"
 	"time"
@@ -48,6 +51,15 @@ type Orchestrator struct {
 
 	// recoveryState holds crash recovery state when resuming a previous session.
 	recoveryState *state.OrchestratorState
+
+	// taskDescription stores the original task description for re-planning.
+	taskDescription string
+
+	// warnedBudget tracks whether the budget warning has been shown.
+	warnedBudget bool
+
+	// configHash stores the hash of the initial config for drift detection.
+	configHash string
 }
 
 // New creates a new Orchestrator.
@@ -102,6 +114,9 @@ func (o *Orchestrator) SetRecoveryState(rs *state.OrchestratorState) {
 
 // Run executes the full wave orchestration loop.
 func (o *Orchestrator) Run(ctx context.Context, taskDescription string) error {
+	o.taskDescription = taskDescription
+	o.configHash = computeConfigHash(o.config)
+
 	// Start lifecycle monitor if configured
 	if o.lifecycle != nil {
 		monitorCtx, monitorCancel := context.WithCancel(ctx)
@@ -168,7 +183,14 @@ func (o *Orchestrator) Run(ctx context.Context, taskDescription string) error {
 			}
 		}
 
+		const maxReplanAttempts = 3
+		replanAttempts := 0
 		for {
+			if replanAttempts >= maxReplanAttempts {
+				o.ui.Warn(fmt.Sprintf("max re-plan attempts (%d) reached", maxReplanAttempts))
+				return ErrPlanRejected
+			}
+
 			plan, err := o.runPlanning(ctx, taskDescription, priorContext)
 			if err != nil {
 				return fmt.Errorf("planning: %w", err)
@@ -209,6 +231,7 @@ func (o *Orchestrator) Run(ctx context.Context, taskDescription string) error {
 			case ui.PlanAbort:
 				return ErrPlanRejected
 			case ui.PlanReplan:
+				replanAttempts++
 				o.ui.Info("Re-planning...")
 				if feedback != "" {
 					priorContext += fmt.Sprintf("\n\nUser feedback on previous plan: %s", feedback)
@@ -222,12 +245,21 @@ func (o *Orchestrator) Run(ctx context.Context, taskDescription string) error {
 			}
 			break
 		}
+
+		// Post-plan lifecycle hook
+		o.runHook("post_plan", o.config.Hooks.PostPlan)
 	}
 
 	// Wave cycles (development -> validation -> merge -> repeat)
 	for cycle := startCycle; cycle <= o.config.Limits.MaxWaveCycles; cycle++ {
 		o.state.WaveCycle = cycle
 		o.taskStore.File().WaveCycle = cycle
+
+		// Config drift detection
+		if newHash := computeConfigHash(o.config); newHash != o.configHash {
+			o.ui.Warn("configuration has changed since session start")
+			o.configHash = newHash
+		}
 
 		// Check budget circuit breaker
 		if err := o.checkBudgetCircuitBreaker(); err != nil {
@@ -245,6 +277,7 @@ func (o *Orchestrator) Run(ctx context.Context, taskDescription string) error {
 		}
 
 		// Wave 3: Validation
+		o.runHook("pre_validation", o.config.Hooks.PreValidation)
 		o.state.Phase = "validation"
 		o.persistState()
 		valResults := o.runValidation(ctx)
@@ -258,6 +291,7 @@ func (o *Orchestrator) Run(ctx context.Context, taskDescription string) error {
 		o.persistState()
 		changesets := o.collectChangesets()
 		approved, requeued := o.presentChangesets(ctx, changesets)
+		o.runHook("post_merge", o.config.Hooks.PostMerge)
 		if err := o.taskStore.Save(); err != nil {
 			o.ui.Warn(fmt.Sprintf("save tasks after merge: %v", err))
 		}
@@ -275,11 +309,50 @@ func (o *Orchestrator) Run(ctx context.Context, taskDescription string) error {
 		case ui.SessionContinue:
 			continue
 		case ui.SessionReplan:
-			return ErrPlanRejected // Simplified: would re-enter planning
+			// Re-plan: reset pending/failed tasks, re-enter planning with context
+			var accumulated string
+			for _, t := range o.taskStore.Tasks() {
+				switch t.Status {
+				case tasks.StatusDone, tasks.StatusMerged:
+					accumulated += fmt.Sprintf("\n- [completed] %s: %s", t.ID, t.Title)
+				case tasks.StatusFailed:
+					accumulated += fmt.Sprintf("\n- [failed] %s: %s — %s", t.ID, t.Title, t.Result.Notes)
+					t.Status = tasks.StatusPending
+					t.RetryCount = 0
+				case tasks.StatusPending:
+					accumulated += fmt.Sprintf("\n- [pending] %s: %s", t.ID, t.Title)
+				}
+			}
+			priorContext := fmt.Sprintf("Re-planning after wave %d. Previous task state:%s",
+				o.state.WaveCycle, accumulated)
+			plan, err := o.runPlanning(ctx, o.taskDescription, priorContext)
+			if err != nil {
+				return fmt.Errorf("re-plan: %w", err)
+			}
+			// Preserve done/merged tasks, replace remaining with new plan
+			var preserved []tasks.Task
+			for _, t := range o.taskStore.Tasks() {
+				if t.Status == tasks.StatusDone || t.Status == tasks.StatusMerged {
+					preserved = append(preserved, t)
+				}
+			}
+			o.taskStore.SetFile(&tasks.TaskFile{
+				SchemaVersion: 1,
+				SessionID:     o.state.SessionID,
+				WaveCycle:     o.state.WaveCycle,
+				Tasks:         append(preserved, plan...),
+			})
+			if err := o.taskStore.Save(); err != nil {
+				return fmt.Errorf("save re-planned tasks: %w", err)
+			}
+			continue
 		case ui.SessionStop:
 			return nil
 		}
 	}
+
+	// Clean up session resources
+	o.cleanupSession()
 
 	// Save session to memory provider
 	if o.memory != nil {
@@ -507,6 +580,7 @@ func (o *Orchestrator) handleDevelopmentResults(results []agent.AgentResult) {
 					violations = append(violations, fmt.Sprintf("%s: %s", v.Type, v.Path))
 				}
 				task.Fail(fmt.Sprintf("postcheck violations: %v", violations))
+				o.runHook("on_failure", o.config.Hooks.OnFailure)
 				if task.RetryCount < o.config.Limits.MaxRetries {
 					task.Requeue("postcheck failure", tasks.HistoryEntry{
 						Attempt:    task.RetryCount + 1,
@@ -523,6 +597,7 @@ func (o *Orchestrator) handleDevelopmentResults(results []agent.AgentResult) {
 			}
 		} else {
 			task.Fail(fmt.Sprintf("exit code %d", result.ExitCode))
+			o.runHook("on_failure", o.config.Hooks.OnFailure)
 
 			// Check retries
 			if task.RetryCount < o.config.Limits.MaxRetries {
@@ -564,7 +639,20 @@ func (o *Orchestrator) runValidation(ctx context.Context) []agent.AgentResult {
 			continue
 		}
 
-		valAgent, err := o.spawner.SpawnValidator(ctx, task, "", "", o.config)
+		// Compute diff for the validator
+		var diff string
+		if o.worktrees != nil {
+			if d, err := o.worktrees.Diff(task.ID); err == nil {
+				diff = d
+			} else {
+				o.ui.Warn(fmt.Sprintf("diff for %s: %v", task.ID, err))
+			}
+		}
+
+		// Build audit summary from git log
+		auditSummary := o.gitLogSummary(task)
+
+		valAgent, err := o.spawner.SpawnValidator(ctx, task, diff, auditSummary, o.config)
 		if err != nil {
 			continue
 		}
@@ -574,6 +662,24 @@ func (o *Orchestrator) runValidation(ctx context.Context) []agent.AgentResult {
 	}
 
 	return results
+}
+
+// gitLogSummary returns a one-line-per-commit summary of work on a task branch.
+func (o *Orchestrator) gitLogSummary(task *tasks.Task) string {
+	if task.Worktree == "" {
+		return ""
+	}
+	baseBranch := o.config.Project.BaseBranch
+	if baseBranch == "" {
+		baseBranch = "main"
+	}
+	cmd := exec.Command("git", "log", "--oneline", baseBranch+".."+task.Branch)
+	cmd.Dir = task.Worktree
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(output))
 }
 
 func (o *Orchestrator) handleValidationResults(results []agent.AgentResult) {
@@ -640,9 +746,77 @@ func (o *Orchestrator) collectChangesets() []Changeset {
 		groups[group].Description += task.Title + "; "
 	}
 
+	// Order changesets by inter-group dependency edges
+	return o.orderChangesets(groups, allTasks)
+}
+
+// orderChangesets sorts changeset groups topologically based on inter-group task dependencies.
+func (o *Orchestrator) orderChangesets(groups map[string]*Changeset, allTasks []tasks.Task) []Changeset {
+	if len(groups) <= 1 {
+		var result []Changeset
+		for _, cs := range groups {
+			result = append(result, *cs)
+		}
+		return result
+	}
+
+	// Map each task to its group
+	taskToGroup := make(map[string]string)
+	for _, task := range allTasks {
+		group := task.CohesionGroup
+		if group == "" {
+			group = "default"
+		}
+		taskToGroup[task.ID] = group
+	}
+
+	// Build inter-group dependency edges as pseudo-tasks for topological sort
+	groupEdges := make(map[string]map[string]bool) // group -> set of dependency groups
+	for _, task := range allTasks {
+		srcGroup := taskToGroup[task.ID]
+		if groups[srcGroup] == nil {
+			continue
+		}
+		for _, depID := range task.Dependencies {
+			depGroup := taskToGroup[depID]
+			if depGroup != srcGroup && groups[depGroup] != nil {
+				if groupEdges[srcGroup] == nil {
+					groupEdges[srcGroup] = make(map[string]bool)
+				}
+				groupEdges[srcGroup][depGroup] = true
+			}
+		}
+	}
+
+	// Build pseudo-tasks for topological sort
+	var pseudoTasks []tasks.Task
+	for groupName := range groups {
+		var deps []string
+		for dep := range groupEdges[groupName] {
+			deps = append(deps, dep)
+		}
+		pseudoTasks = append(pseudoTasks, tasks.Task{
+			ID:           groupName,
+			Dependencies: deps,
+		})
+	}
+
+	sorted, err := tasks.TopologicalSort(pseudoTasks)
+	if err != nil {
+		// Cycle detected — fall back to arbitrary order
+		o.ui.Warn("changeset dependency cycle detected, using arbitrary order")
+		var result []Changeset
+		for _, cs := range groups {
+			result = append(result, *cs)
+		}
+		return result
+	}
+
 	var result []Changeset
-	for _, cs := range groups {
-		result = append(result, *cs)
+	for _, groupName := range sorted {
+		if cs, ok := groups[groupName]; ok {
+			result = append(result, *cs)
+		}
 	}
 	return result
 }
@@ -697,6 +871,19 @@ func (o *Orchestrator) presentChangesets(ctx context.Context, changesets []Chang
 							o.ui.Warn(fmt.Sprintf("remove worktree for %s: %v", task.ID, err))
 						}
 						if err := o.worktrees.MergeBranch(task.ID); err != nil {
+							if errors.Is(err, worktree.ErrMergeConflict) {
+								o.ui.Warn(fmt.Sprintf("merge conflict for %s, requeuing", task.ID))
+								task.Status = tasks.StatusDone // revert from merged
+								task.Requeue("merge conflict", tasks.HistoryEntry{
+									Attempt:   task.RetryCount + 1,
+									Timestamp: time.Now(),
+									Result:    "merge_conflict",
+									Notes:     err.Error(),
+								})
+								requeued++
+								approved--
+								continue
+							}
 							o.ui.Warn(fmt.Sprintf("merge branch for %s: %v", task.ID, err))
 						}
 						if err := o.worktrees.RemoveBranch(task.ID); err != nil {
@@ -734,12 +921,27 @@ func (o *Orchestrator) hasRemainingTasks() bool {
 }
 
 func (o *Orchestrator) checkBudgetCircuitBreaker() error {
+	warnThreshold := o.config.Limits.TokenBudget.WarnThreshold
+	if warnThreshold <= 0 {
+		warnThreshold = 0.8 // default 80%
+	}
+
 	if limit := o.config.Limits.MaxSessionCostUSD; limit > 0 {
+		if !o.warnedBudget && o.sessionCost >= limit*warnThreshold {
+			o.ui.Warn(fmt.Sprintf("session cost $%.2f approaching limit $%.2f (%.0f%%)",
+				o.sessionCost, limit, warnThreshold*100))
+			o.warnedBudget = true
+		}
 		if o.sessionCost >= limit {
 			return fmt.Errorf("session cost $%.2f exceeds limit $%.2f", o.sessionCost, limit)
 		}
 	}
 	if limit := o.config.Limits.MaxSessionTokens; limit > 0 {
+		if !o.warnedBudget && float64(o.sessionTokens) >= float64(limit)*warnThreshold {
+			o.ui.Warn(fmt.Sprintf("session tokens %d approaching limit %d (%.0f%%)",
+				o.sessionTokens, limit, warnThreshold*100))
+			o.warnedBudget = true
+		}
 		if o.sessionTokens >= limit {
 			return fmt.Errorf("session tokens %d exceeds limit %d", o.sessionTokens, limit)
 		}
@@ -814,6 +1016,50 @@ func (o *Orchestrator) SessionSummary() ui.CostSummary {
 		TasksFailed:    failed,
 		TasksMerged:    merged,
 	}
+}
+
+// cleanupSession releases all locks and removes stale worktrees.
+func (o *Orchestrator) cleanupSession() {
+	if o.locks != nil {
+		o.locks.ReleaseAll()
+	}
+	if o.worktrees != nil {
+		stale, err := o.worktrees.FindStale()
+		if err != nil {
+			o.ui.Warn(fmt.Sprintf("find stale worktrees: %v", err))
+			return
+		}
+		for _, path := range stale {
+			// Use git worktree remove via the path
+			cmd := exec.Command("git", "worktree", "remove", "--force", path)
+			cmd.Dir = o.config.Project.Repo
+			if out, err := cmd.CombinedOutput(); err != nil {
+				o.ui.Warn(fmt.Sprintf("remove stale worktree %s: %s: %v", path, strings.TrimSpace(string(out)), err))
+			}
+		}
+	}
+}
+
+// runHook executes a lifecycle hook script if non-empty. Failures are logged but non-fatal.
+func (o *Orchestrator) runHook(name, script string) {
+	if script == "" {
+		return
+	}
+	cmd := exec.Command("bash", "-c", script)
+	cmd.Dir = o.config.Project.Repo
+	if output, err := cmd.CombinedOutput(); err != nil {
+		o.ui.Warn(fmt.Sprintf("hook %s failed: %s: %v", name, strings.TrimSpace(string(output)), err))
+	}
+}
+
+// computeConfigHash returns a sha256 hex digest of the config's JSON representation.
+func computeConfigHash(cfg *config.Config) string {
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		return ""
+	}
+	h := sha256.Sum256(data)
+	return fmt.Sprintf("%x", h)
 }
 
 // HandleShutdown gracefully terminates all running agents and persists state.

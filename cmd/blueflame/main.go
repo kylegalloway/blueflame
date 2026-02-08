@@ -158,9 +158,12 @@ func main() {
 	var memProvider memory.Provider
 	if cfg.Beads.Enabled {
 		memProvider = memory.NewBeadsProvider(memory.BeadsConfig{
-			Enabled:             true,
-			ArchiveAfterWave:    cfg.Beads.ArchiveAfterWave,
-			IncludeFailureNotes: cfg.Beads.IncludeFailureNotes,
+			Enabled:                  true,
+			ArchiveAfterWave:         cfg.Beads.ArchiveAfterWave,
+			IncludeFailureNotes:      cfg.Beads.IncludeFailureNotes,
+			MemoryDecay:              cfg.Beads.MemoryDecay,
+			SummarizeAfterSessions:   cfg.Beads.DecayPolicy.SummarizeAfterSessions,
+			PreserveFailuresSessions: cfg.Beads.DecayPolicy.PreserveFailuresSessions,
 		})
 	} else {
 		memProvider = &memory.NoopProvider{}

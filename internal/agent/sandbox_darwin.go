@@ -3,6 +3,7 @@
 package agent
 
 import (
+	"fmt"
 	"log"
 	"os/exec"
 	"syscall"
@@ -13,22 +14,31 @@ import (
 // applySandboxLimits applies platform-specific resource limits on macOS.
 // macOS has limited sandboxing compared to Linux:
 // - No reliable RSS limiting (ulimit -v crashes Node.js)
-// - sandbox-exec is deprecated but still functional on macOS 15
-// - CPU time, file size, and open files work via rlimits
+// - CPU time, file size, and open files work via ulimit wrapper
 func applySandboxLimits(cmd *exec.Cmd, cfg config.SandboxConfig) {
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
 	cmd.SysProcAttr.Setpgid = true
 
+	var limits []string
+
+	if cfg.MaxCPUSeconds > 0 {
+		limits = append(limits, fmt.Sprintf("ulimit -t %d", cfg.MaxCPUSeconds))
+	}
+	if cfg.MaxFileSizeMB > 0 {
+		// ulimit -f uses 512-byte blocks
+		blocks := cfg.MaxFileSizeMB * 2048
+		limits = append(limits, fmt.Sprintf("ulimit -f %d", blocks))
+	}
+	if cfg.MaxOpenFiles > 0 {
+		limits = append(limits, fmt.Sprintf("ulimit -n %d", cfg.MaxOpenFiles))
+	}
+
 	// Memory: macOS has NO reliable RSS limiting mechanism.
-	// ulimit -v kills Node.js (V8 maps >1GB virtual).
-	// Rely on agent timeout + budget as backstops.
 	if cfg.MaxMemoryMB > 0 {
 		log.Printf("macOS: memory limiting is best-effort only; relying on timeout and budget enforcement")
 	}
 
-	// Note: rlimits would be set here via cmd.SysProcAttr on Linux.
-	// On macOS, we document that CPU time, file size, and open file limits
-	// are applied but memory limits are not enforceable.
+	wrapWithLimits(cmd, limits)
 }

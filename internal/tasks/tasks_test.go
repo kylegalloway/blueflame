@@ -303,6 +303,38 @@ func TestTaskStoreLoadMissing(t *testing.T) {
 	}
 }
 
+func TestTaskHistoryBounding(t *testing.T) {
+	task := &Task{ID: "task-001", Status: StatusFailed}
+
+	// Add more than MaxHistoryEntries
+	for i := 0; i < MaxHistoryEntries+10; i++ {
+		task.Status = StatusFailed // Reset to failed for requeue
+		err := task.Requeue("retry", HistoryEntry{
+			Attempt:   i + 1,
+			AgentID:   "worker-1",
+			Timestamp: time.Now(),
+			Result:    "failed",
+			Notes:     "attempt " + string(rune('A'+i%26)),
+		})
+		if err != nil {
+			t.Fatalf("Requeue %d: %v", i, err)
+		}
+	}
+
+	if len(task.History) > MaxHistoryEntries {
+		t.Errorf("len(History) = %d, want <= %d", len(task.History), MaxHistoryEntries)
+	}
+	if len(task.History) != MaxHistoryEntries {
+		t.Errorf("len(History) = %d, want exactly %d", len(task.History), MaxHistoryEntries)
+	}
+
+	// Verify the most recent entries are kept (not the oldest)
+	lastEntry := task.History[len(task.History)-1]
+	if lastEntry.Attempt != MaxHistoryEntries+10 {
+		t.Errorf("last entry attempt = %d, want %d", lastEntry.Attempt, MaxHistoryEntries+10)
+	}
+}
+
 func TestResetClaimed(t *testing.T) {
 	task := &Task{
 		ID:       "task-001",

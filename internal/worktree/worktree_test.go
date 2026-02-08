@@ -1,6 +1,7 @@
 package worktree
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -274,4 +275,115 @@ func TestDiff(t *testing.T) {
 	}
 
 	mgr.Remove("worker-diff")
+}
+
+func TestMergeConflictDetection(t *testing.T) {
+	repoDir := setupGitRepo(t)
+	wtDir := filepath.Join(repoDir, ".trees")
+	mgr := NewManager(repoDir, wtDir, "main")
+
+	// Create worktree and modify README.md (same file as main)
+	wtPath, _, err := mgr.Create("worker-conflict", "task-conflict")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Change README.md in the worktree
+	os.WriteFile(filepath.Join(wtPath, "README.md"), []byte("# Branch version\n"), 0o644)
+	for _, args := range [][]string{
+		{"git", "add", "."},
+		{"git", "commit", "-m", "branch: modify README"},
+	} {
+		cmd := exec.Command(args[0], args[1:]...)
+		cmd.Dir = wtPath
+		cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=Test", "GIT_AUTHOR_EMAIL=test@test.com",
+			"GIT_COMMITTER_NAME=Test", "GIT_COMMITTER_EMAIL=test@test.com")
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%v: %s: %v", args, output, err)
+		}
+	}
+
+	// Now also change README.md on main (creating a conflict)
+	os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("# Main version\n"), 0o644)
+	for _, args := range [][]string{
+		{"git", "add", "."},
+		{"git", "commit", "-m", "main: modify README"},
+	} {
+		cmd := exec.Command(args[0], args[1:]...)
+		cmd.Dir = repoDir
+		cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=Test", "GIT_AUTHOR_EMAIL=test@test.com",
+			"GIT_COMMITTER_NAME=Test", "GIT_COMMITTER_EMAIL=test@test.com")
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%v: %s: %v", args, output, err)
+		}
+	}
+
+	// Remove worktree before merge
+	if err := mgr.Remove("worker-conflict"); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+
+	// Merge should detect conflict
+	err = mgr.MergeBranch("task-conflict")
+	if err == nil {
+		t.Fatal("expected merge conflict error")
+	}
+	if !errors.Is(err, ErrMergeConflict) {
+		t.Errorf("err = %v, want ErrMergeConflict", err)
+	}
+}
+
+func TestMergeConflictAborts(t *testing.T) {
+	repoDir := setupGitRepo(t)
+	wtDir := filepath.Join(repoDir, ".trees")
+	mgr := NewManager(repoDir, wtDir, "main")
+
+	// Create conflict scenario same as above
+	wtPath, _, err := mgr.Create("worker-conflict2", "task-conflict2")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	os.WriteFile(filepath.Join(wtPath, "README.md"), []byte("# Branch v2\n"), 0o644)
+	for _, args := range [][]string{
+		{"git", "add", "."}, {"git", "commit", "-m", "branch change"},
+	} {
+		cmd := exec.Command(args[0], args[1:]...)
+		cmd.Dir = wtPath
+		cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=Test", "GIT_AUTHOR_EMAIL=test@test.com",
+			"GIT_COMMITTER_NAME=Test", "GIT_COMMITTER_EMAIL=test@test.com")
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%v: %s: %v", args, output, err)
+		}
+	}
+
+	os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("# Main v2\n"), 0o644)
+	for _, args := range [][]string{
+		{"git", "add", "."}, {"git", "commit", "-m", "main change"},
+	} {
+		cmd := exec.Command(args[0], args[1:]...)
+		cmd.Dir = repoDir
+		cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=Test", "GIT_AUTHOR_EMAIL=test@test.com",
+			"GIT_COMMITTER_NAME=Test", "GIT_COMMITTER_EMAIL=test@test.com")
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%v: %s: %v", args, output, err)
+		}
+	}
+
+	mgr.Remove("worker-conflict2")
+
+	// Attempt merge (will fail with conflict)
+	mgr.MergeBranch("task-conflict2")
+
+	// Verify no merge is in progress (MERGE_HEAD should not exist)
+	mergeHeadPath := filepath.Join(repoDir, ".git", "MERGE_HEAD")
+	if _, err := os.Stat(mergeHeadPath); err == nil {
+		t.Error("MERGE_HEAD still exists — merge was not aborted")
+	}
+}
+
+func TestErrMergeConflictSentinel(t *testing.T) {
+	if ErrMergeConflict.Error() != "merge conflict" {
+		t.Errorf("ErrMergeConflict.Error() = %q, want %q", ErrMergeConflict.Error(), "merge conflict")
+	}
 }

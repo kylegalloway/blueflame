@@ -24,9 +24,10 @@ type WorkerPromptData struct {
 
 // ValidatorPromptData holds data for rendering validator prompts.
 type ValidatorPromptData struct {
-	Task         *tasks.Task
-	Diff         string
-	AuditSummary string
+	Task               *tasks.Task
+	Diff               string
+	AuditSummary       string
+	DiagnosticCommands []string
 }
 
 // MergerPromptData holds data for rendering merger prompts.
@@ -158,6 +159,12 @@ func renderValidatorPrompt(d ValidatorPromptData) string {
 	fmt.Fprintf(&b, "Validate task %s: %s\n\nDiff:\n%s", d.Task.ID, d.Task.Title, d.Diff)
 	if d.AuditSummary != "" {
 		fmt.Fprintf(&b, "\n\nAudit summary:\n%s", d.AuditSummary)
+	}
+	if len(d.DiagnosticCommands) > 0 {
+		fmt.Fprintf(&b, "\n\nDiagnostic commands to run:\n")
+		for _, cmd := range d.DiagnosticCommands {
+			fmt.Fprintf(&b, "- %s\n", cmd)
+		}
 	}
 	return b.String()
 }

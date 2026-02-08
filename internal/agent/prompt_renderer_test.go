@@ -165,3 +165,26 @@ func TestDefaultPromptRendererWrongDataType(t *testing.T) {
 		t.Error("expected error for wrong data type")
 	}
 }
+
+func TestValidatorDiagnosticCommands(t *testing.T) {
+	r := &DefaultPromptRenderer{}
+
+	task := &tasks.Task{ID: "task-001", Title: "Add auth"}
+	prompt, err := r.RenderPrompt(RoleValidator, ValidatorPromptData{
+		Task:               task,
+		Diff:               "+func Auth() {}",
+		DiagnosticCommands: []string{"go test ./...", "go vet ./..."},
+	})
+	if err != nil {
+		t.Fatalf("RenderPrompt: %v", err)
+	}
+	if !strings.Contains(prompt, "go test ./...") {
+		t.Error("prompt should contain diagnostic command")
+	}
+	if !strings.Contains(prompt, "go vet ./...") {
+		t.Error("prompt should contain diagnostic command")
+	}
+	if !strings.Contains(prompt, "Diagnostic") {
+		t.Error("prompt should contain diagnostic section header")
+	}
+}

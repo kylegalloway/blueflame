@@ -1,12 +1,16 @@
 package worktree
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 )
+
+// ErrMergeConflict is returned when a git merge results in conflicts.
+var ErrMergeConflict = errors.New("merge conflict")
 
 // Manager handles git worktree operations.
 type Manager struct {
@@ -122,6 +126,7 @@ func (m *Manager) Remove(agentID string) error {
 // MergeBranch merges a task branch into the base branch.
 // The worktree for this branch must be removed first (you can't merge
 // a branch that's checked out in a worktree).
+// Returns ErrMergeConflict (wrapped) if the merge has conflicts.
 func (m *Manager) MergeBranch(taskID string) error {
 	branch := BranchName(taskID)
 
@@ -135,8 +140,17 @@ func (m *Manager) MergeBranch(taskID string) error {
 	// Merge the task branch
 	mergeCmd := exec.Command("git", "merge", branch, "-m", fmt.Sprintf("Merge %s", branch))
 	mergeCmd.Dir = m.repoDir
-	if output, err := mergeCmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("git merge %s: %s: %w", branch, strings.TrimSpace(string(output)), err)
+	output, err := mergeCmd.CombinedOutput()
+	if err != nil {
+		outStr := string(output)
+		if strings.Contains(outStr, "CONFLICT") || strings.Contains(outStr, "Automatic merge failed") {
+			// Abort the failed merge to leave repo in clean state
+			abortCmd := exec.Command("git", "merge", "--abort")
+			abortCmd.Dir = m.repoDir
+			abortCmd.Run() // best-effort
+			return fmt.Errorf("git merge %s: %w: %s", branch, ErrMergeConflict, strings.TrimSpace(outStr))
+		}
+		return fmt.Errorf("git merge %s: %s: %w", branch, strings.TrimSpace(outStr), err)
 	}
 
 	return nil

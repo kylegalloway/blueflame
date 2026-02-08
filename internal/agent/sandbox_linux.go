@@ -3,6 +3,7 @@
 package agent
 
 import (
+	"fmt"
 	"os/exec"
 	"syscall"
 
@@ -10,7 +11,7 @@ import (
 )
 
 // applySandboxLimits applies platform-specific resource limits on Linux.
-// Linux has full sandboxing support via cgroups v2, rlimits, and CLONE_NEWNET.
+// Linux has full sandboxing support via rlimits, CLONE_NEWNET, and ulimit wrapper.
 func applySandboxLimits(cmd *exec.Cmd, cfg config.SandboxConfig) {
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
@@ -22,6 +23,23 @@ func applySandboxLimits(cmd *exec.Cmd, cfg config.SandboxConfig) {
 		cmd.SysProcAttr.Cloneflags = syscall.CLONE_NEWNET
 	}
 
-	// Note: cgroups v2 memory limits and rlimits would be applied here.
-	// Implementation deferred to Phase 3 full production hardening.
+	var limits []string
+
+	if cfg.MaxCPUSeconds > 0 {
+		limits = append(limits, fmt.Sprintf("ulimit -t %d", cfg.MaxCPUSeconds))
+	}
+	if cfg.MaxFileSizeMB > 0 {
+		blocks := cfg.MaxFileSizeMB * 2048
+		limits = append(limits, fmt.Sprintf("ulimit -f %d", blocks))
+	}
+	if cfg.MaxOpenFiles > 0 {
+		limits = append(limits, fmt.Sprintf("ulimit -n %d", cfg.MaxOpenFiles))
+	}
+	if cfg.MaxMemoryMB > 0 {
+		// RLIMIT_AS via ulimit -v (kilobytes)
+		kb := cfg.MaxMemoryMB * 1024
+		limits = append(limits, fmt.Sprintf("ulimit -v %d", kb))
+	}
+
+	wrapWithLimits(cmd, limits)
 }

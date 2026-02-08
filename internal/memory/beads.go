@@ -8,9 +8,12 @@ import (
 
 // BeadsConfig holds Beads-specific configuration.
 type BeadsConfig struct {
-	Enabled             bool
-	ArchiveAfterWave    bool
-	IncludeFailureNotes bool
+	Enabled                  bool
+	ArchiveAfterWave         bool
+	IncludeFailureNotes      bool
+	MemoryDecay              bool
+	SummarizeAfterSessions   int
+	PreserveFailuresSessions int
 }
 
 // BeadsProvider implements Provider using the beads CLI.
@@ -74,11 +77,21 @@ func (m *BeadsProvider) Save(session SessionResult) error {
 }
 
 func (m *BeadsProvider) Load() (SessionContext, error) {
-	output, err := exec.Command("beads", "load",
+	args := []string{
+		"load",
 		"--type", "task-failure,session-summary",
 		"--format", "json",
 		"--limit", "20",
-	).Output()
+	}
+
+	if m.config.MemoryDecay && m.config.SummarizeAfterSessions > 0 {
+		args = append(args, "--summarize-after", fmt.Sprintf("%d", m.config.SummarizeAfterSessions))
+	}
+	if m.config.MemoryDecay && m.config.PreserveFailuresSessions > 0 {
+		args = append(args, "--preserve-failures", fmt.Sprintf("%d", m.config.PreserveFailuresSessions))
+	}
+
+	output, err := exec.Command("beads", args...).Output()
 	if err != nil {
 		// Graceful degradation: no beads data available
 		return SessionContext{}, nil

@@ -106,6 +106,9 @@ func (t *Task) MarkBlocked(reason string) error {
 	return nil
 }
 
+// MaxHistoryEntries limits how many history entries a task retains.
+const MaxHistoryEntries = 50
+
 // Requeue transitions a task back to pending with history.
 func (t *Task) Requeue(notes string, entry HistoryEntry) error {
 	if t.Status != StatusFailed && t.Status != StatusDone {
@@ -113,6 +116,9 @@ func (t *Task) Requeue(notes string, entry HistoryEntry) error {
 			t.ID, t.Status, StatusFailed, StatusDone)
 	}
 	t.History = append(t.History, entry)
+	if len(t.History) > MaxHistoryEntries {
+		t.History = t.History[len(t.History)-MaxHistoryEntries:]
+	}
 	t.Status = StatusPending
 	t.AgentID = ""
 	t.Worktree = ""

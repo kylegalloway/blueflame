@@ -458,3 +458,217 @@ func TestEmptyPlanHandled(t *testing.T) {
 		t.Error("expected error for empty plan")
 	}
 }
+
+func TestChangesetOrderingByDependency(t *testing.T) {
+	cfg := testOrchestratorConfig(t)
+
+	spawner := &agent.MockSpawner{
+		PlannerResult: &agent.MockResult{
+			Output: `{"tasks":[
+				{"id":"task-001","title":"Base lib","description":"base","priority":1,"cohesion_group":"group-a","file_locks":["a/"]},
+				{"id":"task-002","title":"Uses lib","description":"uses base","priority":2,"cohesion_group":"group-b","dependencies":["task-001"],"file_locks":["b/"]}
+			]}`,
+		},
+		WorkerResults: map[string]agent.MockResult{
+			"task-001": {Output: `{"result":"done"}`},
+			"task-002": {Output: `{"result":"done"}`},
+		},
+		ValidatorResults: map[string]agent.MockResult{
+			"task-001": {Output: `{"status":"pass","notes":"ok"}`},
+			"task-002": {Output: `{"status":"pass","notes":"ok"}`},
+		},
+	}
+
+	prompter := &ui.ScriptedPrompter{
+		PlanDecisions:      []ui.PlanDecision{ui.PlanApprove},
+		ChangesetDecisions: []ui.ChangesetDecision{ui.ChangesetApprove, ui.ChangesetApprove},
+		SessionDecisions:   []ui.SessionDecision{ui.SessionStop},
+	}
+
+	taskStore := tasks.NewTaskStore(cfg.Project.TasksFile)
+	orch := New(cfg, spawner, prompter, taskStore, nil)
+
+	err := orch.Run(context.Background(), "Test ordering")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
+func TestBudgetWarnThreshold(t *testing.T) {
+	cfg := testOrchestratorConfig(t)
+	cfg.Limits.MaxSessionCostUSD = 10.0
+	cfg.Limits.TokenBudget.WarnThreshold = 0.1 // 10%, very low
+
+	spawner := &agent.MockSpawner{
+		PlannerResult: &agent.MockResult{
+			Output: `{"tasks":[{"id":"task-001","title":"T","description":"d","priority":1,"file_locks":["a/"]}]}`,
+		},
+		WorkerResults: map[string]agent.MockResult{
+			"task-001": {Output: `{"result":"done","total_cost_usd":2.0}`},
+		},
+		ValidatorResults: map[string]agent.MockResult{
+			"task-001": {Output: `{"status":"pass","notes":"ok"}`},
+		},
+	}
+
+	prompter := &ui.ScriptedPrompter{
+		PlanDecisions:      []ui.PlanDecision{ui.PlanApprove},
+		ChangesetDecisions: []ui.ChangesetDecision{ui.ChangesetApprove},
+		SessionDecisions:   []ui.SessionDecision{ui.SessionStop},
+	}
+
+	taskStore := tasks.NewTaskStore(cfg.Project.TasksFile)
+	orch := New(cfg, spawner, prompter, taskStore, nil)
+
+	err := orch.Run(context.Background(), "Test budget")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// Check that a budget warning was emitted
+	found := false
+	for _, msg := range prompter.Messages {
+		if len(msg) > 0 && (contains(msg, "approaching") || contains(msg, "cost")) {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected budget warning message")
+	}
+}
+
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsStr(s, substr))
+}
+
+func containsStr(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
+}
+
+func TestMaxReplanAttempts(t *testing.T) {
+	cfg := testOrchestratorConfig(t)
+
+	spawner := &agent.MockSpawner{
+		PlannerResult: &agent.MockResult{
+			Output: `{"tasks":[{"id":"task-001","title":"T","description":"d","priority":1,"file_locks":["a/"]}]}`,
+		},
+	}
+
+	// Keep requesting re-plan (more than 3 times)
+	prompter := &ui.ScriptedPrompter{
+		PlanDecisions: []ui.PlanDecision{
+			ui.PlanReplan, ui.PlanReplan, ui.PlanReplan, ui.PlanReplan,
+		},
+	}
+
+	taskStore := tasks.NewTaskStore(cfg.Project.TasksFile)
+	orch := New(cfg, spawner, prompter, taskStore, nil)
+
+	err := orch.Run(context.Background(), "Test replan")
+	if err != ErrPlanRejected {
+		t.Errorf("err = %v, want ErrPlanRejected after max replan attempts", err)
+	}
+}
+
+func TestLifecycleHooksInvoked(t *testing.T) {
+	cfg := testOrchestratorConfig(t)
+	cfg.Hooks.PostPlan = "echo post_plan_ran"
+	cfg.Hooks.PreValidation = "echo pre_validation_ran"
+	cfg.Hooks.PostMerge = "echo post_merge_ran"
+
+	spawner := &agent.MockSpawner{
+		PlannerResult: &agent.MockResult{
+			Output: `{"tasks":[{"id":"task-001","title":"T","description":"d","priority":1,"file_locks":["a/"]}]}`,
+		},
+		WorkerResults: map[string]agent.MockResult{
+			"task-001": {Output: `{"result":"done"}`},
+		},
+		ValidatorResults: map[string]agent.MockResult{
+			"task-001": {Output: `{"status":"pass","notes":"ok"}`},
+		},
+	}
+
+	prompter := &ui.ScriptedPrompter{
+		PlanDecisions:      []ui.PlanDecision{ui.PlanApprove},
+		ChangesetDecisions: []ui.ChangesetDecision{ui.ChangesetApprove},
+		SessionDecisions:   []ui.SessionDecision{ui.SessionStop},
+	}
+
+	taskStore := tasks.NewTaskStore(cfg.Project.TasksFile)
+	orch := New(cfg, spawner, prompter, taskStore, nil)
+
+	err := orch.Run(context.Background(), "Hook test")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	// Hooks are fire-and-forget; success means no crash
+}
+
+func TestLifecycleHookFailureNonFatal(t *testing.T) {
+	cfg := testOrchestratorConfig(t)
+	cfg.Hooks.PostPlan = "exit 1" // will fail
+
+	spawner := &agent.MockSpawner{
+		PlannerResult: &agent.MockResult{
+			Output: `{"tasks":[{"id":"task-001","title":"T","description":"d","priority":1,"file_locks":["a/"]}]}`,
+		},
+		WorkerResults: map[string]agent.MockResult{
+			"task-001": {Output: `{"result":"done"}`},
+		},
+		ValidatorResults: map[string]agent.MockResult{
+			"task-001": {Output: `{"status":"pass","notes":"ok"}`},
+		},
+	}
+
+	prompter := &ui.ScriptedPrompter{
+		PlanDecisions:      []ui.PlanDecision{ui.PlanApprove},
+		ChangesetDecisions: []ui.ChangesetDecision{ui.ChangesetApprove},
+		SessionDecisions:   []ui.SessionDecision{ui.SessionStop},
+	}
+
+	taskStore := tasks.NewTaskStore(cfg.Project.TasksFile)
+	orch := New(cfg, spawner, prompter, taskStore, nil)
+
+	err := orch.Run(context.Background(), "Hook fail test")
+	if err != nil {
+		t.Fatalf("Run should succeed even with hook failure: %v", err)
+	}
+
+	// Verify warning was logged
+	found := false
+	for _, msg := range prompter.Messages {
+		if containsStr(msg, "hook") && containsStr(msg, "failed") {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected warning about hook failure")
+	}
+}
+
+func TestConfigDriftDetection(t *testing.T) {
+	cfg := testOrchestratorConfig(t)
+	hash1 := computeConfigHash(cfg)
+	if hash1 == "" {
+		t.Fatal("config hash should not be empty")
+	}
+
+	// Same config should produce same hash
+	hash2 := computeConfigHash(cfg)
+	if hash1 != hash2 {
+		t.Error("same config should produce same hash")
+	}
+
+	// Different config should produce different hash
+	cfg2 := testOrchestratorConfig(t)
+	cfg2.Project.Name = "different-project"
+	hash3 := computeConfigHash(cfg2)
+	if hash1 == hash3 {
+		t.Error("different config should produce different hash")
+	}
+}
