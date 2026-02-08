@@ -240,18 +240,27 @@ func (o *Orchestrator) Run(ctx context.Context, taskDescription string) error {
 		o.persistState()
 		devResults := o.runDevelopment(ctx)
 		o.handleDevelopmentResults(devResults)
+		if err := o.taskStore.Save(); err != nil {
+			o.ui.Warn(fmt.Sprintf("save tasks after development: %v", err))
+		}
 
 		// Wave 3: Validation
 		o.state.Phase = "validation"
 		o.persistState()
 		valResults := o.runValidation(ctx)
 		o.handleValidationResults(valResults)
+		if err := o.taskStore.Save(); err != nil {
+			o.ui.Warn(fmt.Sprintf("save tasks after validation: %v", err))
+		}
 
 		// Wave 4: Merge
 		o.state.Phase = "merge"
 		o.persistState()
 		changesets := o.collectChangesets()
 		approved, requeued := o.presentChangesets(ctx, changesets)
+		if err := o.taskStore.Save(); err != nil {
+			o.ui.Warn(fmt.Sprintf("save tasks after merge: %v", err))
+		}
 
 		// Check if more work remains
 		if !o.hasRemainingTasks() {
@@ -682,6 +691,15 @@ func (o *Orchestrator) presentChangesets(ctx context.Context, changesets []Chang
 			for _, taskID := range cs.TaskIDs {
 				if task := o.taskStore.FindTask(taskID); task != nil {
 					task.Status = tasks.StatusMerged
+					// Clean up worktree and branch after successful merge
+					if o.worktrees != nil && task.AgentID != "" {
+						if err := o.worktrees.Remove(task.AgentID); err != nil {
+							o.ui.Warn(fmt.Sprintf("remove worktree for %s: %v", task.ID, err))
+						}
+						if err := o.worktrees.RemoveBranch(task.ID); err != nil {
+							o.ui.Warn(fmt.Sprintf("remove branch for %s: %v", task.ID, err))
+						}
+					}
 				}
 			}
 		case ui.ChangesetReject:

@@ -106,6 +106,7 @@ func TestDefaultPromptRendererMerger(t *testing.T) {
 			{Name: "blueflame/task-001", TaskID: "task-001", TaskTitle: "Add auth"},
 			{Name: "blueflame/task-002", TaskID: "task-002", TaskTitle: "Add tests"},
 		},
+		BaseBranch: "main",
 	})
 	if err != nil {
 		t.Fatalf("RenderPrompt: %v", err)
@@ -116,6 +117,15 @@ func TestDefaultPromptRendererMerger(t *testing.T) {
 	}
 	if !strings.Contains(prompt, "Add tests") {
 		t.Error("prompt should contain task title")
+	}
+	if !strings.Contains(prompt, "into main") {
+		t.Error("prompt should specify base branch")
+	}
+	if !strings.Contains(prompt, "git checkout main") {
+		t.Error("prompt should include checkout step")
+	}
+	if !strings.Contains(prompt, "git merge blueflame/task-001") {
+		t.Error("prompt should include merge step")
 	}
 }
 

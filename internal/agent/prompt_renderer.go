@@ -31,7 +31,8 @@ type ValidatorPromptData struct {
 
 // MergerPromptData holds data for rendering merger prompts.
 type MergerPromptData struct {
-	Branches []BranchInfo
+	Branches   []BranchInfo
+	BaseBranch string
 }
 
 // DefaultPromptRenderer implements PromptRenderer with built-in templates.
@@ -117,15 +118,15 @@ Check for:
 - Style: Does it follow project conventions?
 - Safety: Are there security concerns?`
 
-const mergerSystemPrompt = `You are a merge agent. Merge the validated branches into the base branch.
+const mergerSystemPrompt = `You are a merge agent. Your job is to merge validated feature branches into the base branch using git.
 
-For each branch:
-1. Check for merge conflicts
-2. Resolve conflicts if possible
-3. Verify tests pass after merge
-4. Create a merge commit
+Workflow:
+1. Run "git checkout <base_branch>" to ensure you are on the target branch
+2. For each feature branch, run "git merge <branch_name>"
+3. If there are merge conflicts, resolve them and commit
+4. After all merges, verify the build still passes
 
-If conflicts cannot be resolved automatically, report them.`
+Do NOT create new branches. Merge directly into the base branch specified in the prompt.`
 
 func renderPlannerPrompt(d PlannerPromptData) string {
 	var b strings.Builder
@@ -159,9 +160,19 @@ func renderValidatorPrompt(d ValidatorPromptData) string {
 
 func renderMergerPrompt(d MergerPromptData) string {
 	var b strings.Builder
-	b.WriteString("Merge the following validated branches:\n")
+	baseBranch := d.BaseBranch
+	if baseBranch == "" {
+		baseBranch = "main"
+	}
+	fmt.Fprintf(&b, "Merge the following validated branches into %s:\n", baseBranch)
 	for _, br := range d.Branches {
 		fmt.Fprintf(&b, "- %s (task %s: %s)\n", br.Name, br.TaskID, br.TaskTitle)
 	}
+	fmt.Fprintf(&b, "\nSteps:\n")
+	fmt.Fprintf(&b, "1. git checkout %s\n", baseBranch)
+	for i, br := range d.Branches {
+		fmt.Fprintf(&b, "%d. git merge %s\n", i+2, br.Name)
+	}
+	fmt.Fprintf(&b, "%d. Resolve any conflicts\n", len(d.Branches)+2)
 	return b.String()
 }

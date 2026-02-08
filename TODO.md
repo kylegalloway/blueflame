@@ -34,7 +34,7 @@
 
 - [ ] **Session re-plan is a stub** — `PlanReplan` works (appends feedback to prior context, re-enters planning loop), but `SessionReplan` just returns `ErrPlanRejected` instead of re-entering the planning phase mid-session. (`internal/orchestrator/orchestrator.go:212`)
 
-- [ ] **Crash recovery resume** — Detects recovery state but always starts fresh. No resume from saved wave/phase.
+- [x] **Crash recovery resume** — CrashRecoveryPrompt in Prompter interface. Task.ResetClaimed() + TaskStore.ResetClaimedTasks() for dead agent cleanup. Orchestrator.SetRecoveryState() skips planning, restores session state, resumes at wave cycle.
 
 - [ ] **Lifecycle hooks not invoked** — `post_plan`, `pre_validation`, `post_merge`, `on_failure` scripts are parsed from config but never executed.
 
@@ -51,6 +51,16 @@
 - [ ] **Validator receives empty diff and audit summary** — `runValidation()` passes empty strings for both `diff` and `auditSummary` to `SpawnValidator()`. Validators have no context about what the worker actually changed. Should compute `git diff base..branch` and summarize the agent's audit log. (`internal/orchestrator/orchestrator.go:502`)
 
 - [ ] **PostCheck silently passes when no commits exist** — `gitDiffNameStatus()` returns `nil, nil` when git diff fails (e.g., no commits on the branch), causing postcheck to pass silently instead of flagging that the worker produced no output. (`internal/agent/postcheck.go:65`)
+
+## Golden Path Issues (discovered in E2E testing)
+
+- [x] **Stale branches block worktree creation on rerun** — `worktree.Create()` now does best-effort deletion of pre-existing branch before `git worktree add -b`.
+
+- [x] **Merger doesn't specify base branch** — `MergerPromptData` now includes `BaseBranch`. Merger prompt and system prompt prescribe explicit `git checkout <base> && git merge <branch>` workflow.
+
+- [x] **tasks.yaml state not persisted across wave phases** — `taskStore.Save()` now called after development, validation, and merge phases.
+
+- [x] **Worktrees/branches not cleaned up after successful merge** — Worktrees and branches for merged tasks are now removed in `presentChangesets()` after successful merger.
 
 ## Low (plan features not yet implemented)
 

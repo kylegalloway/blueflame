@@ -56,6 +56,11 @@ func (m *Manager) Create(agentID, taskID string) (string, string, error) {
 		return "", "", fmt.Errorf("ensure base branch: %w", err)
 	}
 
+	// Best-effort cleanup of stale branch from previous run
+	delCmd := exec.Command("git", "branch", "-D", branch)
+	delCmd.Dir = m.repoDir
+	_ = delCmd.Run()
+
 	cmd := exec.Command("git", "worktree", "add", "-b", branch, wtPath, m.baseBranch)
 	cmd.Dir = m.repoDir
 	output, err := cmd.CombinedOutput()

@@ -320,14 +320,21 @@ func (s *ProductionSpawner) SpawnMerger(ctx context.Context, branches []BranchIn
 	}
 
 	// Render task prompt
+	baseBranch := cfg.Project.BaseBranch
+	if baseBranch == "" {
+		baseBranch = "main"
+	}
 	var desc strings.Builder
-	desc.WriteString("Merge the following validated branches:\n")
+	fmt.Fprintf(&desc, "Merge the following validated branches into %s:\n", baseBranch)
 	for _, b := range branches {
 		fmt.Fprintf(&desc, "- %s (task %s: %s)\n", b.Name, b.TaskID, b.TaskTitle)
 	}
 	prompt := desc.String()
 	if s.PromptRenderer != nil {
-		rendered, err := s.PromptRenderer.RenderPrompt(RoleMerger, MergerPromptData{Branches: branches})
+		rendered, err := s.PromptRenderer.RenderPrompt(RoleMerger, MergerPromptData{
+			Branches:   branches,
+			BaseBranch: baseBranch,
+		})
 		if err == nil {
 			prompt = rendered
 		}

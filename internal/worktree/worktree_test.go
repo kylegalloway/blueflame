@@ -116,6 +116,36 @@ func TestCreateDuplicateBranch(t *testing.T) {
 	mgr.Remove("worker-1")
 }
 
+func TestCreateAfterStaleBranch(t *testing.T) {
+	repoDir := setupGitRepo(t)
+	wtDir := filepath.Join(repoDir, ".trees")
+	mgr := NewManager(repoDir, wtDir, "main")
+
+	// Create and remove worktree, but leave the branch
+	_, _, err := mgr.Create("worker-1", "task-001")
+	if err != nil {
+		t.Fatalf("first Create: %v", err)
+	}
+	if err := mgr.Remove("worker-1"); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	// Branch "blueflame/task-001" still exists (Remove doesn't delete it)
+
+	// Second create with same task ID should succeed (stale branch cleaned up)
+	wtPath, branch, err := mgr.Create("worker-2", "task-001")
+	if err != nil {
+		t.Fatalf("second Create should succeed after stale branch cleanup: %v", err)
+	}
+	if branch != "blueflame/task-001" {
+		t.Errorf("branch = %q, want %q", branch, "blueflame/task-001")
+	}
+	if _, err := os.Stat(wtPath); err != nil {
+		t.Errorf("worktree dir not created: %v", err)
+	}
+
+	mgr.Remove("worker-2")
+}
+
 func TestWorktreePath(t *testing.T) {
 	mgr := NewManager("/repo", "/repo/.trees", "main")
 	got := mgr.WorktreePath("worker-abc")
