@@ -301,6 +301,8 @@ func (s *ProductionSpawner) SpawnMerger(ctx context.Context, branches []BranchIn
 	args := []string{
 		"--print",
 		"--model", cfg.Models.Merger,
+		"--allowed-tools", "Bash,Read,Glob,Grep",
+		"--disallowed-tools", "Write,Edit,WebFetch,WebSearch,NotebookEdit,Task",
 		"--output-format", "json",
 	}
 

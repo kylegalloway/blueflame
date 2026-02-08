@@ -349,8 +349,10 @@ func NewScriptedPrompterFromFile(path string) *ScriptedPrompter {
 
 func (p *ScriptedPrompter) Warn(msg string) {
 	p.Messages = append(p.Messages, "WARN: "+msg)
+	fmt.Fprintf(os.Stderr, "WARNING: %s\n", msg)
 }
 
 func (p *ScriptedPrompter) Info(msg string) {
 	p.Messages = append(p.Messages, msg)
+	fmt.Fprintf(os.Stderr, "%s\n", msg)
 }

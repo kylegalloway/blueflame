@@ -119,6 +119,29 @@ func (m *Manager) Remove(agentID string) error {
 	return nil
 }
 
+// MergeBranch merges a task branch into the base branch.
+// The worktree for this branch must be removed first (you can't merge
+// a branch that's checked out in a worktree).
+func (m *Manager) MergeBranch(taskID string) error {
+	branch := BranchName(taskID)
+
+	// Ensure we're on the base branch
+	checkoutCmd := exec.Command("git", "checkout", m.baseBranch)
+	checkoutCmd.Dir = m.repoDir
+	if output, err := checkoutCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git checkout %s: %s: %w", m.baseBranch, strings.TrimSpace(string(output)), err)
+	}
+
+	// Merge the task branch
+	mergeCmd := exec.Command("git", "merge", branch, "-m", fmt.Sprintf("Merge %s", branch))
+	mergeCmd.Dir = m.repoDir
+	if output, err := mergeCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git merge %s: %s: %w", branch, strings.TrimSpace(string(output)), err)
+	}
+
+	return nil
+}
+
 // RemoveBranch deletes a worktree branch.
 func (m *Manager) RemoveBranch(taskID string) error {
 	branch := BranchName(taskID)

@@ -188,6 +188,58 @@ func TestFindStaleEmpty(t *testing.T) {
 	}
 }
 
+func TestMergeBranch(t *testing.T) {
+	repoDir := setupGitRepo(t)
+	wtDir := filepath.Join(repoDir, ".trees")
+	mgr := NewManager(repoDir, wtDir, "main")
+
+	// Create worktree and add a file
+	wtPath, _, err := mgr.Create("worker-merge", "task-merge")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	os.WriteFile(filepath.Join(wtPath, "merged_file.txt"), []byte("hello\n"), 0o644)
+	for _, args := range [][]string{
+		{"git", "add", "."},
+		{"git", "commit", "-m", "feat(task-merge): add merged file"},
+	} {
+		cmd := exec.Command(args[0], args[1:]...)
+		cmd.Dir = wtPath
+		cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=Test", "GIT_AUTHOR_EMAIL=test@test.com",
+			"GIT_COMMITTER_NAME=Test", "GIT_COMMITTER_EMAIL=test@test.com")
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%v: %s: %v", args, output, err)
+		}
+	}
+
+	// Remove worktree first (required before merge)
+	if err := mgr.Remove("worker-merge"); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+
+	// Merge the branch
+	if err := mgr.MergeBranch("task-merge"); err != nil {
+		t.Fatalf("MergeBranch: %v", err)
+	}
+
+	// Verify the file exists on main
+	if _, err := os.Stat(filepath.Join(repoDir, "merged_file.txt")); err != nil {
+		t.Error("merged_file.txt should exist on main after merge")
+	}
+
+	// Verify git log shows the merge
+	logCmd := exec.Command("git", "log", "--oneline")
+	logCmd.Dir = repoDir
+	logOut, _ := logCmd.Output()
+	if !testing.Short() {
+		t.Logf("git log after merge:\n%s", logOut)
+	}
+
+	// Clean up branch
+	mgr.RemoveBranch("task-merge")
+}
+
 func TestDiff(t *testing.T) {
 	repoDir := setupGitRepo(t)
 	wtDir := filepath.Join(repoDir, ".trees")

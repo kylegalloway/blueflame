@@ -99,6 +99,10 @@ Minimize dependencies between tasks to maximize parallelism. Each task should be
 
 const workerSystemPrompt = `You are a development agent. Implement the assigned task completely, including tests. Follow the project's existing patterns and conventions.
 
+IMPORTANT: You MUST commit your changes using git before finishing:
+1. git add the files you created or modified
+2. git commit -m "feat(task-id): description of changes"
+
 Constraints:
 - Only modify files within your declared file_locks scope
 - Create meaningful commits with clear messages

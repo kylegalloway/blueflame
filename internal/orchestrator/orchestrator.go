@@ -691,10 +691,13 @@ func (o *Orchestrator) presentChangesets(ctx context.Context, changesets []Chang
 			for _, taskID := range cs.TaskIDs {
 				if task := o.taskStore.FindTask(taskID); task != nil {
 					task.Status = tasks.StatusMerged
-					// Clean up worktree and branch after successful merge
+					// Clean up worktree, merge branch to base, then delete branch
 					if o.worktrees != nil && task.AgentID != "" {
 						if err := o.worktrees.Remove(task.AgentID); err != nil {
 							o.ui.Warn(fmt.Sprintf("remove worktree for %s: %v", task.ID, err))
+						}
+						if err := o.worktrees.MergeBranch(task.ID); err != nil {
+							o.ui.Warn(fmt.Sprintf("merge branch for %s: %v", task.ID, err))
 						}
 						if err := o.worktrees.RemoveBranch(task.ID); err != nil {
 							o.ui.Warn(fmt.Sprintf("remove branch for %s: %v", task.ID, err))
