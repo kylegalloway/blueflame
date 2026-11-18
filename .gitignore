@@ -24,3 +24,6 @@ bin/
 # Environment / secrets
 .env
 .env.*
+
+# Agent skill configuration (local to this machine)
+docs/agents/
